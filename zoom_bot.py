@@ -133,34 +133,26 @@ _CAPTURE_SCRIPT = r"""
     }
 
     // El primer ondataavailable contiene el init segment (cabecera webm).
-    // Se prepende a todos los chunks siguientes para que Whisper pueda
-    // decodificar cada chunk de forma independiente.
-    let initChunk = null;
+    // Se envía una sola vez; los chunks siguientes se envían tal como llegan.
+    let initSent = false;
 
     const recorder = new MediaRecorder(stream, { mimeType });
 
     recorder.ondataavailable = async (e) => {
       if (e.data.size === 0) return;
       const buf = await e.data.arrayBuffer();
-      let toSend;
-      if (!initChunk) {
-        initChunk = buf;
-        toSend = buf;
+      if (!initSent) {
+        initSent = true;
         console.log('[Capture] init chunk recibido — bytes:', buf.byteLength);
-      } else {
-        const combined = new Uint8Array(initChunk.byteLength + buf.byteLength);
-        combined.set(new Uint8Array(initChunk), 0);
-        combined.set(new Uint8Array(buf), initChunk.byteLength);
-        toSend = combined.buffer;
       }
       if (wsReady && ws.readyState === 1) {
-        ws.send(toSend);
+        ws.send(buf);
         if (!firstChunkSent) {
           firstChunkSent = true;
-          console.log('[Capture] primer chunk enviado — bytes:', toSend.byteLength);
+          console.log('[Capture] primer chunk enviado — bytes:', buf.byteLength);
         }
       } else if (pending.length < 20) {
-        pending.push(toSend);
+        pending.push(buf);
       }
     };
 
