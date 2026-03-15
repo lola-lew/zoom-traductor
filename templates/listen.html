@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Tradutor ao Vivo</title>
+  <title>Tradução ao Vivo</title>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -20,11 +20,24 @@
       gap: 1.5rem;
     }
 
-    header {
-      text-align: center;
-    }
+    header { text-align: center; }
     header h1 { font-size: 1.3rem; font-weight: 600; }
     header p  { font-size: 0.82rem; color: #8b949e; margin-top: 0.25rem; }
+
+    #connectBtn {
+      padding: 0.75rem 2rem;
+      background: #2f81f7;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: filter 0.2s;
+    }
+    #connectBtn:hover { filter: brightness(1.15); }
+    #connectBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+    #connectBtn.connected { background: #3fb950; cursor: default; }
 
     #statusBadge {
       display: inline-flex;
@@ -84,8 +97,10 @@
 <body>
   <header>
     <h1>Tradução ao Vivo</h1>
-    <p>O áudio traduzido será reproduzido automaticamente.</p>
+    <p>Pressione o botão para ativar o áudio e começar a ouvir.</p>
   </header>
+
+  <button id="connectBtn" onclick="connect()">🔊 Conectar e ouvir</button>
 
   <div id="statusBadge">
     <div id="dot"></div>
@@ -97,16 +112,64 @@
   </div>
 
   <script>
-    const socket = io();
+    let audioCtx   = null;
+    let connected  = false;
+    let socket     = null;
+    // Cola de chunks MP3 base64 que llegaron antes de que el usuario conecte
+    const audioQueue = [];
 
-    socket.on('connect', () => setStatus('Conectado', false));
-    socket.on('disconnect', () => setStatus('Desconectado', false));
+    function connect() {
+      if (connected) return;
+      connected = true;
 
-    socket.on('translation', ({ original, translated, audio }) => {
-      setStatus('Ao vivo', true);
-      addCard(original, translated);
-      playAudio(audio);
-    });
+      // Crear AudioContext con gesto de usuario — desbloquea autoplay en todos los browsers
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      const btn = document.getElementById('connectBtn');
+      btn.textContent = '✓ Conectado';
+      btn.classList.add('connected');
+      btn.disabled = true;
+
+      setStatus('Conectado', false);
+
+      // Conectar SocketIO ahora que tenemos AudioContext
+      socket = io();
+      socket.on('connect',    () => setStatus('Conectado', false));
+      socket.on('disconnect', () => setStatus('Desconectado', false));
+
+      socket.on('translation', ({ original, translated }) => {
+        setStatus('Ao vivo', true);
+        addCard(original, translated);
+      });
+
+      socket.on('audio', ({ data }) => {
+        playMp3(data);
+      });
+
+      // Vaciar cola de audio que pudo haber llegado antes
+      while (audioQueue.length) playMp3(audioQueue.shift());
+    }
+
+    async function playMp3(b64) {
+      if (!audioCtx) {
+        // Si el usuario aún no conectó, encolar
+        audioQueue.push(b64);
+        return;
+      }
+      try {
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        const binary = atob(b64);
+        const bytes  = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+        source.start();
+      } catch (e) {
+        console.warn('[listen] playMp3 error:', e.message);
+      }
+    }
 
     function setStatus(msg, live) {
       document.getElementById('statusTxt').textContent = msg;
@@ -123,17 +186,11 @@
         <div class="translated">${esc(translated)}</div>
       `;
       feed.prepend(c);
-      // Limitar a 30 cards visibles
       while (feed.children.length > 30) feed.lastChild.remove();
     }
 
-    function playAudio(b64) {
-      const a = new Audio('data:audio/mp3;base64,' + b64);
-      a.play().catch(() => {});
-    }
-
     function esc(t) {
-      return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
   </script>
 </body>

@@ -2,10 +2,9 @@
 Servidor principal: Flask + Flask-SocketIO + WebSocket interno de audio.
 
 Flujo:
-  Zoom (Playwright) → ws://localhost:8765 (PCM raw)
+  Zoom (Playwright) → ws://localhost:8765 (PCM/webm raw)
        → TranslatorPipeline (Whisper + GPT + TTS)
-       → SocketIO broadcast → clientes web
-       → VdoNinjaBot.play_audio() → VDO.Ninja → estudiantes
+       → SocketIO broadcast → clientes /listen (Web Audio API)
 """
 
 import asyncio
@@ -25,7 +24,6 @@ from flask_socketio import SocketIO, emit
 from playwright.async_api import async_playwright
 
 from translator import LANGUAGES, TranslatorPipeline
-from vdoninja_bot import VdoNinjaBot
 from zoom_bot import CONNECTING, DISCONNECTED, IN_MEETING, ZoomBot
 
 load_dotenv()
@@ -45,7 +43,6 @@ socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
 # ── Configuración ─────────────────────────────────────────────────────────────
 
 AUDIO_WS_PORT = int(os.environ.get('AUDIO_WS_PORT', 8765))
-VDO_STREAM_ID = os.environ.get('VDO_STREAM_ID', uuid.uuid4().hex[:10])
 SESSIONS_DIR  = Path('sessions')
 SESSIONS_DIR.mkdir(exist_ok=True)
 
@@ -58,13 +55,10 @@ _state: dict = {
     'target_lang': 'pt',
 }
 
-translator   = TranslatorPipeline()
-_zoom_bot:  Optional[ZoomBot]       = None
-_vdo_bot:   Optional[VdoNinjaBot]   = None
+translator    = TranslatorPipeline()
+_zoom_bot:    Optional[ZoomBot] = None
 _session_log: Optional['SessionLog'] = None
 
-# Browser compartido: Zoom y VDO.Ninja usan contextos separados del mismo proceso
-# para garantizar que _CAPTURE_SCRIPT (audio de Zoom) nunca afecte a VDO.Ninja.
 _HEADLESS          = os.environ.get('HEADLESS', '0') == '1'
 _shared_playwright = None
 _shared_browser    = None
@@ -82,7 +76,6 @@ def _get_loop() -> asyncio.AbstractEventLoop:
             target=_async_loop.run_forever, daemon=True, name='async-loop'
         )
         _async_thread.start()
-        # Esperar a que el loop esté realmente corriendo antes de continuar
         import time
         for _ in range(20):
             if _async_loop.is_running():
@@ -124,7 +117,7 @@ class SessionLog:
                 f.write(f'\n[FIN] {datetime.datetime.now().strftime("%H:%M:%S")}\n')
 
 
-# ── WebSocket interno (PCM del bot de Zoom) ───────────────────────────────────
+# ── WebSocket interno (PCM/webm del bot de Zoom) ──────────────────────────────
 
 _audio_chunk_count = 0
 
@@ -138,17 +131,12 @@ async def _audio_ws_handler(websocket):
 
             _audio_chunk_count += 1
 
-            # ── Gate: solo procesar audio cuando el bot está confirmado IN_MEETING ──
-            # Evita que el pipeline transcriba audio del fake-device de Chrome
-            # durante el join flow (antes de que Zoom establezca los streams reales)
-            # y que Whisper genere alucinaciones ("You", "Thank you") sobre ruido.
             if _state.get('bot_state') != IN_MEETING:
                 if _audio_chunk_count % 200 == 1:
                     logger.debug('[AudioWS] chunk descartado — bot_state=%s (esperando IN_MEETING)',
                                  _state.get('bot_state'))
                 continue
 
-            # Log cada 50 chunks cuando el pipeline está activo (~12 s de audio)
             if _audio_chunk_count % 50 == 1:
                 logger.info('[AudioWS] chunk #%d — %d bytes', _audio_chunk_count, len(message))
 
@@ -158,33 +146,24 @@ async def _audio_ws_handler(websocket):
 
 
 async def _audio_ws_serve():
-    """Servidor WebSocket para audio PCM del bot de Zoom.
-
-    Usa while-True para reiniciar automáticamente si el servidor se cierra
-    de forma inesperada — garantiza que el pipeline de audio nunca se interrumpa
-    entre el bot de Zoom y el pipeline Whisper→GPT→TTS durante toda la sesión.
-    """
     while True:
         try:
             async with websockets.serve(
                 _audio_ws_handler,
                 'localhost',
                 AUDIO_WS_PORT,
-                ping_interval=None,   # deshabilitar pings — evitar cierres por timeout
-                max_size=2 ** 20,     # 1 MB máximo por mensaje
+                ping_interval=None,
+                max_size=2 ** 20,
             ):
                 logger.info('[AudioWS] servidor escuchando en ws://localhost:%d', AUDIO_WS_PORT)
-                # Esperar indefinidamente; el servidor sólo se detiene si se cancela
-                # esta tarea o si hay una excepción no recuperable.
                 stop_evt = asyncio.Event()
-                await stop_evt.wait()   # nunca se llama a set() → espera para siempre
+                await stop_evt.wait()
 
         except asyncio.CancelledError:
             logger.info('[AudioWS] servidor cancelado — saliendo')
             return
 
         except OSError as e:
-            # Puerto ocupado u otro error de red — reintentar en 3 s
             logger.error('[AudioWS] OSError: %s — reintentando en 3 s', e)
             await asyncio.sleep(3)
 
@@ -200,12 +179,10 @@ def _on_translation(original: str, translated: str, audio_b64: str) -> None:
         'original':   original,
         'translated': translated,
         'lang':       _state['target_lang'],
-        'audio':      audio_b64,
     })
+    socketio.emit('audio', {'data': audio_b64})
     if _session_log:
         _session_log.write(original, translated)
-    if _vdo_bot:
-        _run_async(_vdo_bot.play_audio(audio_b64))
 
 
 def _on_pipeline_error(message: str) -> None:
@@ -224,7 +201,6 @@ def _on_bot_log(msg: str) -> None:
 
 def _on_bot_state_change(bot_state: str, msg: str) -> None:
     _state['bot_state'] = bot_state
-    # Si el bot se desconecta inesperadamente, limpiar el estado global
     if bot_state == DISCONNECTED and _state['running']:
         _state['running'] = False
         translator.stop()
@@ -238,12 +214,7 @@ def _on_bot_state_change(bot_state: str, msg: str) -> None:
 
 @app.route('/')
 def index():
-    return render_template(
-        'index.html',
-        languages=LANGUAGES,
-        vdo_view_url=f'https://vdo.ninja/?view={VDO_STREAM_ID}&autoplay',
-        vdo_stream_id=VDO_STREAM_ID,
-    )
+    return render_template('index.html', languages=LANGUAGES)
 
 
 @app.route('/listen')
@@ -253,15 +224,13 @@ def listen():
 
 @app.route('/ping')
 def ping():
-    """Endpoint de diagnóstico: confirma que el servidor responde HTTP normal."""
     return jsonify({'pong': True, 'state': _state['bot_state']})
 
 
 @app.route('/start', methods=['POST'])
 def start():
-    global _zoom_bot, _vdo_bot, _session_log
+    global _zoom_bot, _session_log
 
-    # ── Diagnóstico: confirmar que el handler se ejecuta ──────────────────
     raw_body = request.get_data(as_text=True)
     print(f'[/start] recibido — body: {raw_body[:300]}', flush=True)
     logger.info('/start recibido — body: %s', raw_body[:300])
@@ -270,22 +239,18 @@ def start():
         logger.warning('/start rechazado — ya está en ejecución')
         return jsonify({'error': 'Ya está en ejecución'}), 400
 
-    # Parsear JSON: force=True ignora Content-Type, silent=True no lanza excepciones
     try:
         import json as _json
         data = _json.loads(raw_body) if raw_body.strip() else {}
     except Exception:
         data = request.get_json(force=True, silent=True) or {}
 
-    # Aceptar link completo ("meeting_url") o solo dígitos ("meeting_id")
     raw_input   = str(data.get('meeting_url') or data.get('meeting_id') or '')
     target_lang = data.get('target_lang', 'pt')
 
-    # Extraer dígitos del ID para logging/SessionLog (funciona con URL o bare ID)
     meeting_id = re.sub(r'\D', '', re.search(r'\d+', raw_input).group()) \
                  if re.search(r'\d+', raw_input) else ''
 
-    # meeting_url_or_id es lo que se pasa al bot: URL completa si la hay, si no los dígitos
     meeting_url_or_id = raw_input.strip() if raw_input.strip().startswith('http') else meeting_id
 
     logger.info('/start — input: %r  id extraído: %r  lang: %s', raw_input, meeting_id, target_lang)
@@ -307,16 +272,9 @@ def start():
     _zoom_bot.on_status        = _on_bot_log
     _zoom_bot.on_status_change = _on_bot_state_change
 
-    _vdo_bot = VdoNinjaBot(stream_id=VDO_STREAM_ID)
-
     async def _start_bots():
         global _shared_playwright, _shared_browser
         try:
-            # ── Procesos de browser completamente separados ───────────────────
-            # ZoomBot usa el browser compartido (con _CAPTURE_SCRIPT inyectado).
-            # VdoNinjaBot lanza su propio playwright/browser independiente:
-            # así el audio del TTS de VDO.Ninja no puede llegar al MediaRecorder
-            # de Zoom aunque compartan el mismo host.
             _shared_playwright = await async_playwright().start()
             _shared_browser = await _shared_playwright.chromium.launch(
                 headless=_HEADLESS,
@@ -333,11 +291,8 @@ def start():
                     '--disable-setuid-sandbox',
                 ],
             )
-            logger.info('[App] browser Zoom iniciado — VDO.Ninja usará proceso separado')
-            await asyncio.gather(
-                _zoom_bot.join(meeting_url_or_id, _browser=_shared_browser),
-                _vdo_bot.start(),   # sin _browser → crea su propio playwright + browser
-            )
+            logger.info('[App] browser iniciado')
+            await _zoom_bot.join(meeting_url_or_id, _browser=_shared_browser)
         except Exception as exc:
             logger.error('Error al iniciar bots: %s', exc)
             _state.update({'running': False, 'bot_state': 'error'})
@@ -348,11 +303,7 @@ def start():
 
     _run_async(_start_bots())
 
-    return jsonify({
-        'status':      'started',
-        'meeting_id':  meeting_id,
-        'vdo_view_url': f'https://vdo.ninja/?view={VDO_STREAM_ID}&autoplay',
-    })
+    return jsonify({'status': 'started', 'meeting_id': meeting_id})
 
 
 @app.route('/stop', methods=['POST'])
@@ -366,14 +317,8 @@ def stop():
 
     async def _stop_bots():
         global _shared_playwright, _shared_browser
-        tasks = []
         if _zoom_bot:
-            tasks.append(_zoom_bot.leave())
-        if _vdo_bot:
-            tasks.append(_vdo_bot.stop())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        # Cerrar el browser compartido después de que ambos bots cerraron sus contextos
+            await _zoom_bot.leave()
         if _shared_browser:
             try:
                 await _shared_browser.close()
@@ -402,9 +347,7 @@ def stop():
 def status():
     return jsonify({
         **_state,
-        'languages':    {k: v['name'] for k, v in LANGUAGES.items()},
-        'vdo_view_url': f'https://vdo.ninja/?view={VDO_STREAM_ID}&autoplay',
-        'vdo_stream_id': VDO_STREAM_ID,
+        'languages': {k: v['name'] for k, v in LANGUAGES.items()},
     })
 
 
@@ -419,14 +362,12 @@ def on_connect():
 # ── Arranque ──────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    # Railway asigna PORT dinámicamente; localmente usa 5000.
     HTTP_PORT = int(os.environ.get('PORT', 5000))
 
     print('=' * 60, flush=True)
     print('  Zoom Tradutor — iniciando servidor...', flush=True)
 
     loop = _get_loop()
-    # Guardar referencia para evitar que el GC cancele la tarea.
     _audio_ws_future = asyncio.run_coroutine_threadsafe(_audio_ws_serve(), loop)  # noqa: F841
     print(f'  Audio WS interno: ws://localhost:{AUDIO_WS_PORT}', flush=True)
     print(f'  Flask-SocketIO:   http://0.0.0.0:{HTTP_PORT}', flush=True)
@@ -438,6 +379,6 @@ if __name__ == '__main__':
         host='0.0.0.0',
         port=HTTP_PORT,
         debug=False,
-        use_reloader=False,        # IMPORTANTE: evita que el reloader mate el loop asyncio
+        use_reloader=False,
         allow_unsafe_werkzeug=True,
     )

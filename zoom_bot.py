@@ -118,13 +118,11 @@ _CAPTURE_SCRIPT = r"""
 
   const connectedTracks = new Set();
   let firstChunkSent = false;
+  let pendingTrack   = null;   // track detectado, esperando __startCapture()
+  let captureArmed   = false;  // true tras llamar __startCapture()
+  let captureStarted = false;  // true una vez que el MediaRecorder arranca
 
-  function attachTrack(track) {
-    if (connectedTracks.has(track.id)) return;
-    connectedTracks.add(track.id);
-    console.log('[Capture] attachTrack — kind:', track.kind, '| id:', track.id,
-                '| readyState:', track.readyState, '| enabled:', track.enabled);
-
+  function startRecorder(track) {
     const stream = new MediaStream([track]);
     console.log('[Capture] MediaStream creado — audioTracks:', stream.getAudioTracks().length,
                 '| active:', stream.active);
@@ -171,6 +169,33 @@ _CAPTURE_SCRIPT = r"""
 
     recorder.start(3000);  // chunk cada 3 s
   }
+
+  function attachTrack(track) {
+    if (connectedTracks.has(track.id)) return;
+    connectedTracks.add(track.id);
+    console.log('[Capture] attachTrack — kind:', track.kind, '| id:', track.id,
+                '| readyState:', track.readyState, '| armed:', captureArmed);
+    pendingTrack = track;
+    // Si __startCapture() ya fue llamado, arrancar inmediatamente
+    if (captureArmed && !captureStarted) {
+      captureStarted = true;
+      startRecorder(track);
+    }
+  }
+
+  // Python llama __startCapture() desde _capture_audio_playwright() cuando
+  // el bot está confirmado IN_MEETING — evita capturar audio del join flow.
+  window.__startCapture = () => {
+    if (captureArmed) return 'already_armed';
+    captureArmed = true;
+    console.log('[Capture] __startCapture() — pendingTrack:', !!pendingTrack);
+    if (pendingTrack && !captureStarted) {
+      captureStarted = true;
+      startRecorder(pendingTrack);
+      return 'started';
+    }
+    return 'armed_waiting_track';
+  };
 
   // Interceptar RTCPeerConnection de Zoom para capturar tracks entrantes
   const _OrigPC = window.RTCPeerConnection;
@@ -1047,14 +1072,21 @@ class ZoomBot:
             logger.info('[Capture] detenido — %d frames enviados', frame_count)
 
     async def _capture_audio_playwright(self) -> None:
-        """Linux: la captura ocurre en el browser via _CAPTURE_SCRIPT.
+        """Linux: llama __startCapture() en la página de Zoom para iniciar MediaRecorder.
 
-        El JS inyectado intercepta RTCPeerConnection, convierte el audio track
-        remoto a PCM int16 a 16 kHz via ScriptProcessorNode, y lo envía
-        directamente al WebSocket interno. Este método solo mantiene la tarea
-        viva mientras dura la reunión.
+        El MediaRecorder solo arranca aquí, después de que el bot está confirmado
+        IN_MEETING, evitando capturar audio del join flow o de la sala de espera.
         """
-        logger.info('[Capture] modo Web Audio API (Linux) — captura en JS')
+        logger.info('[Capture] IN_MEETING confirmado — llamando __startCapture() en la página')
+        try:
+            if self._page and not self._page.is_closed():
+                result = await self._page.evaluate(
+                    '() => window.__startCapture && window.__startCapture()'
+                )
+                logger.info('[Capture] __startCapture() resultado: %s', result)
+        except Exception as e:
+            logger.warning('[Capture] __startCapture() error: %s', e)
+
         while self._monitoring:
             await asyncio.sleep(10)
         logger.info('[Capture] tarea Web Audio API finalizada')
