@@ -294,9 +294,8 @@
   socket.on('bot_status',    ({ message }) => log(message));
   socket.on('pipeline_error',({ message }) => log('Error: ' + message, 'err'));
 
-  socket.on('translation', ({ original, translated, lang, audio }) => {
+  socket.on('translation', ({ original, translated, lang }) => {
     addCard(original, translated, lang);
-    playAudio(audio);
   });
 
   // ── Control ───────────────────────────────────────────────────────────────
@@ -392,10 +391,6 @@
     `;
     feed.prepend(c);
     while (feed.children.length > 50) feed.lastChild.remove();
-  }
-
-  function playAudio(b64) {
-    new Audio('data:audio/mp3;base64,' + b64).play().catch(() => {});
   }
 
   function copy(id) {
