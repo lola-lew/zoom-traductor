@@ -312,10 +312,11 @@ def start():
     async def _start_bots():
         global _shared_playwright, _shared_browser
         try:
-            # ── Un solo browser, dos contextos aislados ──────────────────────
-            # Zoom recibe _CAPTURE_SCRIPT en su contexto.
-            # VDO.Ninja recibe solo _INIT_SCRIPT en el suyo.
-            # Así es imposible que el audio de VDO.Ninja sea capturado por Whisper.
+            # ── Procesos de browser completamente separados ───────────────────
+            # ZoomBot usa el browser compartido (con _CAPTURE_SCRIPT inyectado).
+            # VdoNinjaBot lanza su propio playwright/browser independiente:
+            # así el audio del TTS de VDO.Ninja no puede llegar al MediaRecorder
+            # de Zoom aunque compartan el mismo host.
             _shared_playwright = await async_playwright().start()
             _shared_browser = await _shared_playwright.chromium.launch(
                 headless=_HEADLESS,
@@ -332,10 +333,10 @@ def start():
                     '--disable-setuid-sandbox',
                 ],
             )
-            logger.info('[App] browser compartido iniciado — creando contextos aislados')
+            logger.info('[App] browser Zoom iniciado — VDO.Ninja usará proceso separado')
             await asyncio.gather(
                 _zoom_bot.join(meeting_url_or_id, _browser=_shared_browser),
-                _vdo_bot.start(_browser=_shared_browser),
+                _vdo_bot.start(),   # sin _browser → crea su propio playwright + browser
             )
         except Exception as exc:
             logger.error('Error al iniciar bots: %s', exc)
