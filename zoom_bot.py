@@ -123,11 +123,13 @@ _CAPTURE_SCRIPT = r"""
   const connectedTracks = new Set();
   let firstChunkSent = false;
 
+  let firstProcFired = false;
+
   function attachTrack(track) {
     if (connectedTracks.has(track.id)) return;
     connectedTracks.add(track.id);
-    console.log('[Capture] track detectado:', track.kind, '| id:', track.id,
-                '| readyState:', track.readyState);
+    console.log('[Capture] attachTrack — kind:', track.kind, '| id:', track.id,
+                '| readyState:', track.readyState, '| enabled:', track.enabled);
 
     if (!audioCtx) {
       audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -135,11 +137,29 @@ _CAPTURE_SCRIPT = r"""
                   '| state:', audioCtx.state);
     }
 
-    const stream  = new MediaStream([track]);
-    const source  = audioCtx.createMediaStreamSource(stream);
-    const proc    = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+    // Asegurar que el AudioContext está activo — en headless onaudioprocess
+    // no se dispara si el contexto permanece en suspended.
+    if (audioCtx.state !== 'running') {
+      audioCtx.resume().then(() => {
+        console.log('[Capture] AudioContext.resume() OK — state:', audioCtx.state);
+      }).catch((err) => {
+        console.warn('[Capture] AudioContext.resume() error:', err.message);
+      });
+    }
+
+    const stream = new MediaStream([track]);
+    console.log('[Capture] MediaStream creado — tracks en stream:', stream.getAudioTracks().length,
+                '| track en stream activo:', stream.active);
+
+    const source = audioCtx.createMediaStreamSource(stream);
+    const proc   = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
     proc.onaudioprocess = (e) => {
+      if (!firstProcFired) {
+        firstProcFired = true;
+        console.log('[Capture] onaudioprocess fired — samples:', e.inputBuffer.length,
+                    '| ctx state:', audioCtx.state, '| wsReady:', wsReady);
+      }
       const f32 = e.inputBuffer.getChannelData(0);
       const i16 = new Int16Array(f32.length);
       for (let i = 0; i < f32.length; i++) {
@@ -161,7 +181,8 @@ _CAPTURE_SCRIPT = r"""
     // ScriptProcessorNode necesita estar conectado a destination para disparar
     source.connect(proc);
     proc.connect(audioCtx.destination);
-    console.log('[Capture] ScriptProcessorNode conectado — bufferSize:', proc.bufferSize);
+    console.log('[Capture] ScriptProcessorNode conectado — bufferSize:', proc.bufferSize,
+                '| ctx state post-connect:', audioCtx.state);
   }
 
   // Interceptar RTCPeerConnection de Zoom para capturar tracks entrantes
