@@ -808,28 +808,37 @@ class ZoomBot:
         usa el primero que acepte 48 kHz de entrada.
         """
         # ── Seleccionar dispositivo ────────────────────────────────────────
+        # Linux (Railway/Docker): usar dispositivo PulseAudio por defecto.
+        # Windows (local): probar índices VB-Cable en orden.
+        import platform as _platform
         device_idx  = None
         device_name = '?'
-        for candidate in _CAPTURE_DEVICE_CANDIDATES:
-            try:
-                sd.check_input_settings(
-                    device=candidate,
-                    channels=_CAPTURE_CHANNELS,
-                    dtype='float32',
-                    samplerate=_CAPTURE_RATE_DEVICE,
-                )
-                device_idx  = candidate
-                device_name = sd.query_devices(candidate)['name']
-                logger.info('[Capture] dispositivo seleccionado: %d — %s', candidate, device_name)
-                break
-            except Exception as e:
-                logger.warning('[Capture] dispositivo %d no disponible (%s) — probando siguiente',
-                               candidate, e)
+        if _platform.system() != 'Windows':
+            # Linux: sounddevice usa PulseAudio automáticamente con device=None
+            device_idx  = None
+            device_name = 'PulseAudio (default)'
+            logger.info('[Capture] Linux detectado — usando PulseAudio (device=None)')
+        else:
+            for candidate in _CAPTURE_DEVICE_CANDIDATES:
+                try:
+                    sd.check_input_settings(
+                        device=candidate,
+                        channels=_CAPTURE_CHANNELS,
+                        dtype='float32',
+                        samplerate=_CAPTURE_RATE_DEVICE,
+                    )
+                    device_idx  = candidate
+                    device_name = sd.query_devices(candidate)['name']
+                    logger.info('[Capture] dispositivo seleccionado: %d — %s', candidate, device_name)
+                    break
+                except Exception as e:
+                    logger.warning('[Capture] dispositivo %d no disponible (%s) — probando siguiente',
+                                   candidate, e)
 
-        if device_idx is None:
-            logger.error('[Capture] ningún dispositivo VB-Cable disponible en índices %s — abortando',
-                         _CAPTURE_DEVICE_CANDIDATES)
-            return
+            if device_idx is None:
+                logger.error('[Capture] ningún dispositivo VB-Cable disponible en índices %s — abortando',
+                             _CAPTURE_DEVICE_CANDIDATES)
+                return
 
         raw_q: stdlib_queue.Queue = stdlib_queue.Queue(maxsize=400)
 
