@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Zoom Tradutor — Panel</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0d1117;
+      --surface: #161b22;
+      --border:  #30363d;
+      --muted:   #8b949e;
+      --text:    #e6edf3;
+      --accent:  #2f81f7;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --orange:  #db6d28;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      grid-template-rows: auto 1fr;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────── */
+    header {
+      grid-column: 1 / -1;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0.8rem 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 { font-size: 1.05rem; font-weight: 600; flex: 1; }
+
+    /* ── Indicador de estado ────────────────────────────────────────── */
+    #stateBadge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      border-radius: 20px;
+      padding: 0.3rem 0.8rem;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+      transition: all 0.3s;
+    }
+    #stateDot {
+      width: 8px; height: 8px; border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    /* Estados */
+    #stateBadge.idle         { background: #1c1c1c; border-color: var(--border);  color: var(--muted); }
+    #stateBadge.idle         #stateDot { background: var(--muted); }
+
+    #stateBadge.connecting   { background: #0d1f3c; border-color: var(--accent);  color: var(--accent); }
+    #stateBadge.connecting   #stateDot { background: var(--accent); animation: blink 0.9s infinite; }
+
+    #stateBadge.waiting_room { background: #2d1f00; border-color: var(--yellow);  color: var(--yellow); }
+    #stateBadge.waiting_room #stateDot { background: var(--yellow); animation: blink 1.2s infinite; }
+
+    #stateBadge.in_meeting   { background: #0d2614; border-color: var(--green);   color: var(--green); }
+    #stateBadge.in_meeting   #stateDot { background: var(--green);  animation: pulse 1.5s infinite; }
+
+    #stateBadge.disconnected { background: #1a0e0e; border-color: var(--orange);  color: var(--orange); }
+    #stateBadge.disconnected #stateDot { background: var(--orange); }
+
+    #stateBadge.error        { background: #1a0a0a; border-color: var(--red);     color: var(--red); }
+    #stateBadge.error        #stateDot { background: var(--red); animation: blink 0.5s infinite; }
+
+    @keyframes blink  { 50% { opacity: 0.15; } }
+    @keyframes pulse  { 0%, 100% { box-shadow: 0 0 0 0 rgba(63,185,80,.6); }
+                        50%       { box-shadow: 0 0 0 5px rgba(63,185,80,0); } }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────── */
+    aside {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.1rem;
+      overflow-y: auto;
+    }
+
+    .field label {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+    .field input, .field select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      outline: none;
+    }
+    .field input:focus, .field select:focus { border-color: var(--accent); }
+
+    #toggleBtn {
+      width: 100%;
+      padding: 0.65rem;
+      border-radius: 6px;
+      border: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      transition: filter 0.2s;
+    }
+    #toggleBtn:hover:not(:disabled) { filter: brightness(1.15); }
+    #toggleBtn.stop { background: var(--red); }
+    #toggleBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* ── Links de estudiantes ────────────────────────────────────────── */
+    .link-box {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.7rem;
+    }
+    .link-box .lbl {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+      margin-bottom: 0.3rem;
+    }
+    .link-row { display: flex; gap: 0.4rem; }
+    .link-row input {
+      flex: 1; background: transparent; border: none;
+      color: var(--accent); font-size: 0.78rem; outline: none; min-width: 0;
+    }
+    .copy-btn {
+      background: var(--border); border: none; color: var(--text);
+      border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.7rem; cursor: pointer;
+    }
+    .copy-btn:hover { background: var(--muted); }
+
+    /* ── Log de estado ───────────────────────────────────────────────── */
+    #statusLog {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 0.6rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+      max-height: 150px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column-reverse;
+      gap: 0.15rem;
+    }
+    #statusLog .sl { line-height: 1.4; font-family: monospace; }
+    #statusLog .sl.err { color: var(--red); }
+    #statusLog .sl.ok  { color: var(--green); }
+
+    /* ── Main: traducciones ──────────────────────────────────────────── */
+    main {
+      padding: 1.25rem;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+    }
+
+    .trans-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.85rem 1rem;
+      animation: fadeIn 0.3s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } }
+    .trans-original   { font-size: 0.76rem; color: var(--muted); margin-bottom: 0.3rem; }
+    .trans-original span { color: #aaa; }
+    .trans-translated { font-size: 0.98rem; color: var(--text); line-height: 1.5; }
+    .trans-meta       { margin-top: 0.35rem; font-size: 0.68rem; color: var(--green); }
+
+    .empty-state { color: var(--border); font-size: 0.85rem; text-align: center; margin: auto; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Zoom Tradutor — Panel de Control</h1>
+  <div id="stateBadge" class="idle">
+    <div id="stateDot"></div>
+    <span id="stateText">PARADO</span>
+  </div>
+</header>
+
+<aside>
+  <!-- Link de Zoom -->
+  <div class="field">
+    <label>Link de Zoom</label>
+    <input id="meetingId" type="url" placeholder="https://us02web.zoom.us/j/87818853738" autocomplete="off"/>
+  </div>
+
+  <!-- Idioma destino -->
+  <div class="field">
+    <label>Idioma destino</label>
+    <select id="targetLang">
+      {% for code, info in languages.items() %}
+      <option value="{{ code }}" {% if code == 'pt' %}selected{% endif %}>
+        {{ info.name }}
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Botón -->
+  <button id="toggleBtn" onclick="toggle()">Iniciar</button>
+
+  <!-- VDO.Ninja -->
+  <div class="link-box">
+    <div class="lbl">Link VDO.Ninja para estudiantes</div>
+    <div class="link-row">
+      <input id="vdoLink" type="text" readonly value="{{ vdo_view_url }}" onclick="this.select()"/>
+      <button class="copy-btn" onclick="copy('vdoLink')">Copiar</button>
+    </div>
+  </div>
+
+  <!-- /listen -->
+  <div class="link-box">
+    <div class="lbl">Link directo (red local)</div>
+    <div class="link-row">
+      <input id="listenLink" type="text" readonly onclick="this.select()"/>
+      <button class="copy-btn" onclick="copy('listenLink')">Copiar</button>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div id="statusLog"><div class="sl">Listo.</div></div>
+</aside>
+
+<main id="feed">
+  <div class="empty-state" id="emptyState">
+    Presiona Iniciar para comenzar la traducción en tiempo real.
+  </div>
+</main>
+
+<script>
+  const socket = io();
+  let running  = false;
+
+  document.getElementById('listenLink').value = location.origin + '/listen';
+
+  // ── Mapa de estados → texto / clase CSS ──────────────────────────────────
+  const STATE_LABEL = {
+    idle:         'PARADO',
+    connecting:   'CONECTANDO...',
+    waiting_room: 'SALA DE ESPERA',
+    in_meeting:   'TRADUZINDO',
+    disconnected: 'DESCONECTADO',
+    error:        'ERRO',
+  };
+
+  // ── SocketIO ─────────────────────────────────────────────────────────────
+  socket.on('connect',    () => log('Conectado ao servidor'));
+  socket.on('disconnect', () => { log('Desconectado', 'err'); setStateBadge('error'); });
+
+  socket.on('status_change', ({ state, message }) => {
+    setStateBadge(state);
+    if (message) log(message, state === 'error' || state === 'disconnected' ? 'err' : '');
+    // Si el bot se desconectó externamente, sincronizar el botón
+    if ((state === 'disconnected' || state === 'idle') && running) {
+      running = false;
+      updateBtn();
+    }
+  });
+
+  socket.on('bot_status',    ({ message }) => log(message));
+  socket.on('pipeline_error',({ message }) => log('Error: ' + message, 'err'));
+
+  socket.on('translation', ({ original, translated, lang, audio }) => {
+    addCard(original, translated, lang);
+    playAudio(audio);
+  });
+
+  // ── Control ───────────────────────────────────────────────────────────────
+  function toggle() { running ? stopBot() : startBot(); }
+
+  function startBot() {
+    const meetingUrl = document.getElementById('meetingId').value.trim();
+    const targetLang = document.getElementById('targetLang').value;
+
+    if (!meetingUrl) { log('Ingresá el link de la reunión Zoom', 'err'); return; }
+
+    const payload = { meeting_url: meetingUrl, target_lang: targetLang };
+    console.log('[startBot] enviando POST /start', payload);
+    log(`Enviando → meeting_url="${meetingUrl}" lang="${targetLang}"`);
+
+    setBtn(true);
+
+    fetch('/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    .then(r => {
+      console.log('[startBot] respuesta HTTP', r.status);
+      log(`Respuesta HTTP: ${r.status}`);
+      return r.json().then(d => ({ status: r.status, data: d }));
+    })
+    .then(({ status, data }) => {
+      if (data.error) {
+        log(`Error ${status}: ${data.error}`, 'err');
+        setBtn(false);
+      } else {
+        log(`OK — meeting ${data.meeting_id || meetingUrl} iniciado`, 'ok');
+        running = true;
+        updateBtn();
+        setBtn(false);
+      }
+    })
+    .catch(e => {
+      console.error('[startBot] fetch error:', e);
+      log('Error de red: ' + e, 'err');
+      setBtn(false);
+    });
+  }
+
+  function stopBot() {
+    setBtn(true);
+    fetch('/stop', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => { log(d.error ? d.error : 'Sesión detenida', d.error ? 'err' : 'ok'); })
+      .catch(e => log('Error al detener: ' + e, 'err'))
+      .finally(() => { running = false; updateBtn(); setBtn(false); });
+  }
+
+  // ── UI helpers ────────────────────────────────────────────────────────────
+  function updateBtn() {
+    const btn = document.getElementById('toggleBtn');
+    btn.textContent = running ? 'Detener' : 'Iniciar';
+    btn.classList.toggle('stop', running);
+  }
+
+  function setBtn(disabled) {
+    document.getElementById('toggleBtn').disabled = disabled;
+  }
+
+  function setStateBadge(state) {
+    const badge = document.getElementById('stateBadge');
+    // Quitar todas las clases de estado anteriores
+    Object.keys(STATE_LABEL).forEach(s => badge.classList.remove(s));
+    badge.classList.add(state);
+    document.getElementById('stateText').textContent = STATE_LABEL[state] || state.toUpperCase();
+  }
+
+  function log(msg, type = '') {
+    const box = document.getElementById('statusLog');
+    const el  = document.createElement('div');
+    el.className = 'sl' + (type ? ' ' + type : '');
+    el.textContent = new Date().toLocaleTimeString() + ' — ' + msg;
+    box.prepend(el);
+    // Limitar a 80 entradas
+    while (box.children.length > 80) box.lastChild.remove();
+  }
+
+  function addCard(original, translated, lang) {
+    document.getElementById('emptyState')?.remove();
+    const feed = document.getElementById('feed');
+    const c    = document.createElement('div');
+    c.className = 'trans-card';
+    c.innerHTML = `
+      <div class="trans-original">Original: <span>${esc(original)}</span></div>
+      <div class="trans-translated">${esc(translated)}</div>
+      <div class="trans-meta">${esc((lang || '').toUpperCase())} · ${new Date().toLocaleTimeString()}</div>
+    `;
+    feed.prepend(c);
+    while (feed.children.length > 50) feed.lastChild.remove();
+  }
+
+  function playAudio(b64) {
+    new Audio('data:audio/mp3;base64,' + b64).play().catch(() => {});
+  }
+
+  function copy(id) {
+    navigator.clipboard.writeText(document.getElementById(id).value)
+      .then(() => log('Link copiado', 'ok'));
+  }
+
+  function esc(t) {
+    return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+</script>
+</body>
+</html>

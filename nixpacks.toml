@@ -1,0 +1,15 @@
+# nixpacks.toml — instrucciones de build para Railway
+# Fase install: dependencias Python
+# Fase build:   Playwright + dependencias de sistema Chromium
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[phases.build]
+cmds = [
+    "playwright install chromium",
+    "playwright install-deps chromium"
+]
+
+[start]
+cmd = "python app.py"

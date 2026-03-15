@@ -1,0 +1,8 @@
+.env
+sessions/
+__pycache__/
+.venv/
+debug_*.png
+*.pyc
+*.pyo
+.idea/
