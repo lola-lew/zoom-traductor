@@ -228,7 +228,7 @@ class ZoomBot:
     # ── Entrada pública ────────────────────────────────────────────────────
 
     @staticmethod
-    def _build_url(meeting_url_or_id: str, display_name: str) -> str:
+    def _build_url(meeting_url_or_id: str, display_name: str, mute_mic: bool = True) -> str:
         """Construye la URL del web client directo, evitando la página /j/ intermedia.
 
         La página /j/ muestra el dialog nativo "¿Abrir Zoom Meetings?" y el botón
@@ -239,11 +239,12 @@ class ZoomBot:
           - URL web client: https://zoom.us/wc/87818853738/join
           - Solo dígitos:  87818853738
         """
-        # av=0  → micrófono muteado al entrar (no transmitimos audio)
         # mv=0, video=0 → cámara desactivada
-        # audio=0 eliminado — ese flag desactiva también el audio ENTRANTE, lo que
-        # impediría que Zoom reproduzca el audio de los participantes por VB-Cable.
-        params = f'prefer=0&name={quote(display_name)}&av=0&mv=0&video=0'
+        # av=0  → micrófono muteado al entrar (solo Windows: en Linux puede bloquear
+        #          la recepción de audio de otros participantes via WebRTC)
+        # audio=0 eliminado — desactiva también el audio ENTRANTE.
+        av_param = '&av=0' if mute_mic else ''
+        params = f'prefer=0&name={quote(display_name)}{av_param}&mv=0&video=0'
 
         if meeting_url_or_id.startswith('http'):
             # Extraer el ID numérico de /j/ID o /wc/ID/
@@ -335,7 +336,10 @@ class ZoomBot:
         # JS (alert/confirm/prompt) que aparezca durante la navegación
         self._page.on('dialog', lambda d: asyncio.ensure_future(d.dismiss()))
 
-        url = self._build_url(meeting_url_or_id, display_name)
+        # En Linux no usar &av=0 — puede bloquear el audio entrante de otros
+        # participantes via WebRTC (tracks de audio que necesita _CAPTURE_SCRIPT)
+        url = self._build_url(meeting_url_or_id, display_name,
+                              mute_mic=(_platform.system() == 'Windows'))
         self._log(f'Navegando directo al web client: {url}')
         await self._page.goto(url, wait_until='domcontentloaded', timeout=30_000)
         self._log(f'URL actual: {self._page.url} | Título: {await self._page.title()}')
