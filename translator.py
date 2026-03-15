@@ -31,6 +31,9 @@ CHANNELS       = 1
 CHUNK_SECONDS  = 3
 CHUNK_SAMPLES  = SAMPLE_RATE * CHUNK_SECONDS   # 48 000 muestras
 
+# Magic bytes del init segment webm/EBML — identifica chunks de MediaRecorder (Linux)
+_WEBM_MAGIC = b'\x1a\x45\xdf\xa3'
+
 # Detección de silencio
 # RMS int16: silencio puro ≈ 0, ruido/fake device ≈ 100-500, voz normal ≈ 500+
 # Umbral conservador para filtrar silencio sin cortar voz real.
@@ -120,11 +123,19 @@ class TranslatorPipeline:
 
     # ── Feed de audio (llamado desde el WebSocket interno) ────────────────
 
-    def feed_audio(self, pcm_bytes: bytes) -> None:
-        """Recibe bytes PCM int16 little-endian y encola chunks completos."""
+    def feed_audio(self, data: bytes) -> None:
+        """Recibe bytes de audio — PCM int16 (Windows) o webm/opus (Linux vía MediaRecorder)."""
         if not self._running:
             return
+        if data[:4] == _WEBM_MAGIC:
+            # Ruta Linux: webm/opus de MediaRecorder → directo a Whisper sin buffer
+            fut = self._executor.submit(self._process_webm, data)
+            fut.add_done_callback(_log_future_error)
+        else:
+            self._feed_pcm(data)
 
+    def _feed_pcm(self, pcm_bytes: bytes) -> None:
+        """Acumula PCM int16 little-endian y encola chunks completos de 3 s."""
         count   = len(pcm_bytes) // 2
         samples = struct.unpack(f'<{count}h', pcm_bytes)
 
@@ -196,7 +207,41 @@ class TranslatorPipeline:
             if self.on_error:
                 self.on_error(str(exc))
 
+    def _process_webm(self, webm_data: bytes) -> None:
+        """Ruta Linux: procesa un chunk webm/opus de MediaRecorder sin buffer PCM."""
+        logger.info('[Pipeline] WEBM chunk — %d bytes — llamando Whisper API...', len(webm_data))
+        try:
+            original, detected_lang = self._transcribe_webm(webm_data)
+            if not original:
+                logger.info('[Pipeline] Whisper devolvió texto vacío — chunk ignorado')
+                return
+            if detected_lang == self.target_lang:
+                logger.info('[Pipeline] chunk descartado — loop detectado (lang=%s)', detected_lang)
+                return
+            logger.info('[Pipeline] Whisper OK: %r (lang=%s)', original, detected_lang)
+            translated = self._translate(original)
+            logger.info('[Pipeline] GPT OK: %r', translated)
+            audio_b64  = self._tts(translated)
+            logger.info('[Pipeline] TTS OK: %d bytes MP3', len(audio_b64) * 3 // 4)
+            if self.on_translation:
+                self.on_translation(original, translated, audio_b64)
+        except Exception as exc:
+            logger.error('[Pipeline] WORKER error (webm): %s', exc, exc_info=True)
+            if self.on_error:
+                self.on_error(str(exc))
+
     # ── Llamadas a OpenAI con reintento automático ────────────────────────
+
+    def _transcribe_webm(self, webm_data: bytes) -> tuple[str, str]:
+        """Transcribe audio webm/opus de MediaRecorder. Devuelve (text, language)."""
+        def _call():
+            t = self._client.audio.transcriptions.create(
+                model='whisper-1',
+                file=('chunk.webm', webm_data, 'audio/webm'),
+                response_format='verbose_json',
+            )
+            return t.text.strip(), (t.language or '').lower()
+        return _retry(_call, 'Whisper')
 
     def _transcribe(self, wav_data: bytes) -> tuple[str, str]:
         """Devuelve (text, language). language es el código ISO detectado por Whisper."""

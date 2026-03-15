@@ -94,9 +94,6 @@ _STEALTH_SCRIPT = r"""
 # chunks binarios via WebSocket al pipeline interno de Whisper.
 _CAPTURE_SCRIPT = r"""
 (wsUrl) => {
-  const SAMPLE_RATE = 16000;   // Hz requerido por Whisper
-  const BUFFER_SIZE = 1600;    // muestras → 100 ms a 16 kHz
-  const AMPLIFY     = 10.0;    // ganancia para compensar nivel bajo de WebRTC
 
   let ws       = null;
   let wsReady  = false;
@@ -119,11 +116,8 @@ _CAPTURE_SCRIPT = r"""
   }
   connectWS();
 
-  let audioCtx = null;
   const connectedTracks = new Set();
   let firstChunkSent = false;
-
-  let firstProcFired = false;
 
   function attachTrack(track) {
     if (connectedTracks.has(track.id)) return;
@@ -131,58 +125,51 @@ _CAPTURE_SCRIPT = r"""
     console.log('[Capture] attachTrack — kind:', track.kind, '| id:', track.id,
                 '| readyState:', track.readyState, '| enabled:', track.enabled);
 
-    if (!audioCtx) {
-      audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-      console.log('[Capture] AudioContext creado — sampleRate:', audioCtx.sampleRate,
-                  '| state:', audioCtx.state);
-    }
-
-    // Asegurar que el AudioContext está activo — en headless onaudioprocess
-    // no se dispara si el contexto permanece en suspended.
-    if (audioCtx.state !== 'running') {
-      audioCtx.resume().then(() => {
-        console.log('[Capture] AudioContext.resume() OK — state:', audioCtx.state);
-      }).catch((err) => {
-        console.warn('[Capture] AudioContext.resume() error:', err.message);
-      });
-    }
-
     const stream = new MediaStream([track]);
-    console.log('[Capture] MediaStream creado — tracks en stream:', stream.getAudioTracks().length,
-                '| track en stream activo:', stream.active);
+    console.log('[Capture] MediaStream creado — audioTracks:', stream.getAudioTracks().length,
+                '| active:', stream.active);
 
-    const source = audioCtx.createMediaStreamSource(stream);
-    const proc   = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+    const mimeType = 'audio/webm;codecs=opus';
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      console.warn('[Capture] mimeType no soportado:', mimeType, '— usando default');
+    }
 
-    proc.onaudioprocess = (e) => {
-      if (!firstProcFired) {
-        firstProcFired = true;
-        console.log('[Capture] onaudioprocess fired — samples:', e.inputBuffer.length,
-                    '| ctx state:', audioCtx.state, '| wsReady:', wsReady);
+    // El primer ondataavailable contiene el init segment (cabecera webm).
+    // Se prepende a todos los chunks siguientes para que Whisper pueda
+    // decodificar cada chunk de forma independiente.
+    let initChunk = null;
+
+    const recorder = new MediaRecorder(stream, { mimeType });
+
+    recorder.ondataavailable = async (e) => {
+      if (e.data.size === 0) return;
+      const buf = await e.data.arrayBuffer();
+      let toSend;
+      if (!initChunk) {
+        initChunk = buf;
+        toSend = buf;
+        console.log('[Capture] init chunk recibido — bytes:', buf.byteLength);
+      } else {
+        const combined = new Uint8Array(initChunk.byteLength + buf.byteLength);
+        combined.set(new Uint8Array(initChunk), 0);
+        combined.set(new Uint8Array(buf), initChunk.byteLength);
+        toSend = combined.buffer;
       }
-      const f32 = e.inputBuffer.getChannelData(0);
-      const i16 = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++) {
-        const v = Math.max(-1.0, Math.min(1.0, f32[i] * AMPLIFY));
-        i16[i] = (v * 32767) | 0;
-      }
-      const buf = i16.buffer.slice(0);
       if (wsReady && ws.readyState === 1) {
-        ws.send(buf);
+        ws.send(toSend);
         if (!firstChunkSent) {
           firstChunkSent = true;
-          console.log('[Capture] primer chunk enviado — bytes:', buf.byteLength);
+          console.log('[Capture] primer chunk enviado — bytes:', toSend.byteLength);
         }
-      } else if (pending.length < 200) {
-        pending.push(buf);   // conservar hasta ~20 s de buffer mientras WS reconecta
+      } else if (pending.length < 20) {
+        pending.push(toSend);
       }
     };
 
-    // ScriptProcessorNode necesita estar conectado a destination para disparar
-    source.connect(proc);
-    proc.connect(audioCtx.destination);
-    console.log('[Capture] ScriptProcessorNode conectado — bufferSize:', proc.bufferSize,
-                '| ctx state post-connect:', audioCtx.state);
+    recorder.onstart = () => console.log('[Capture] MediaRecorder started — mimeType:', recorder.mimeType);
+    recorder.onerror = (e) => console.error('[Capture] MediaRecorder error:', e.error?.message);
+
+    recorder.start(3000);  // chunk cada 3 s
   }
 
   // Interceptar RTCPeerConnection de Zoom para capturar tracks entrantes
