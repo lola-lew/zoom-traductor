@@ -50,16 +50,6 @@ _INIT_SCRIPT = r"""
   // Intentar resume inmediato (puede fallar sin gesto; se reintenta tras click)
   ctx.resume().catch(() => {});
 
-  // Oscilador de keep-alive: frecuencia 1 Hz, gain 0.001 (casi silencio).
-  // Mantiene el track activo con audio válido para que VDO.Ninja inicie WebRTC.
-  const keepAliveOsc  = ctx.createOscillator();
-  const keepAliveGain = ctx.createGain();
-  keepAliveOsc.frequency.value = 1;
-  keepAliveGain.gain.value     = 0.001;
-  keepAliveOsc.connect(keepAliveGain);
-  keepAliveGain.connect(dest);
-  keepAliveOsc.start();
-
   // ── 2. Interceptar getUserMedia ───────────────────────────────────────────
   // VDO.Ninja llama getUserMedia({audio: true}) con &miconly.
   // Devolvemos dest.stream: el track de este stream es el que VDO.Ninja
