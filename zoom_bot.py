@@ -107,28 +107,32 @@ _CAPTURE_SCRIPT = r"""
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       wsReady = true;
-      console.log('[CaptureScript] WS conectado:', wsUrl);
+      console.log('[Capture] WS conectado:', wsUrl);
       while (pending.length) ws.send(pending.shift());
     };
     ws.onclose = () => {
       wsReady = false;
-      console.warn('[CaptureScript] WS cerrado — reconectando en 2 s');
+      console.warn('[Capture] WS cerrado — reconectando en 2 s');
       setTimeout(connectWS, 2000);
     };
-    ws.onerror = (e) => console.warn('[CaptureScript] WS error:', e.type);
+    ws.onerror = (e) => console.warn('[Capture] WS error:', e.type);
   }
   connectWS();
 
   let audioCtx = null;
   const connectedTracks = new Set();
+  let firstChunkSent = false;
 
   function attachTrack(track) {
     if (connectedTracks.has(track.id)) return;
     connectedTracks.add(track.id);
-    console.log('[CaptureScript] track de audio adjuntado:', track.id);
+    console.log('[Capture] track detectado:', track.kind, '| id:', track.id,
+                '| readyState:', track.readyState);
 
     if (!audioCtx) {
       audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+      console.log('[Capture] AudioContext creado — sampleRate:', audioCtx.sampleRate,
+                  '| state:', audioCtx.state);
     }
 
     const stream  = new MediaStream([track]);
@@ -145,6 +149,10 @@ _CAPTURE_SCRIPT = r"""
       const buf = i16.buffer.slice(0);
       if (wsReady && ws.readyState === 1) {
         ws.send(buf);
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          console.log('[Capture] primer chunk enviado — bytes:', buf.byteLength);
+        }
       } else if (pending.length < 200) {
         pending.push(buf);   // conservar hasta ~20 s de buffer mientras WS reconecta
       }
@@ -153,20 +161,23 @@ _CAPTURE_SCRIPT = r"""
     // ScriptProcessorNode necesita estar conectado a destination para disparar
     source.connect(proc);
     proc.connect(audioCtx.destination);
+    console.log('[Capture] ScriptProcessorNode conectado — bufferSize:', proc.bufferSize);
   }
 
   // Interceptar RTCPeerConnection de Zoom para capturar tracks entrantes
   const _OrigPC = window.RTCPeerConnection;
   window.RTCPeerConnection = function(...args) {
     const pc = new _OrigPC(...args);
+    console.log('[Capture] nuevo PC creado — total interceptados:', window.__capturePC = (window.__capturePC || 0) + 1);
     pc.addEventListener('track', (event) => {
+      console.log('[Capture] track detectado en PC:', event.track.kind);
       if (event.track.kind === 'audio') attachTrack(event.track);
     });
     return pc;
   };
   Object.assign(window.RTCPeerConnection, _OrigPC);
 
-  console.log('[CaptureScript] inyectado — wsUrl:', wsUrl, '| esperando tracks de audio');
+  console.log('[Capture] script iniciado — wsUrl:', wsUrl);
 }
 """
 
@@ -312,6 +323,13 @@ class ZoomBot:
                         self.audio_ws_url)
 
         self._page = await self._context.new_page()
+
+        # Reenviar consola del browser a Python (especialmente para diagnóstico
+        # de _CAPTURE_SCRIPT en Linux donde la captura ocurre en JS)
+        def _fwd_console(msg):
+            lvl = {'error': logger.error, 'warning': logger.warning}.get(msg.type, logger.info)
+            lvl('[ZoomBot-browser] %s', msg.text)
+        self._page.on('console', _fwd_console)
 
         # Registrar handler ANTES de goto() para capturar cualquier dialog
         # JS (alert/confirm/prompt) que aparezca durante la navegación
