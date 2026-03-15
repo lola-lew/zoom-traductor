@@ -15,8 +15,10 @@ Requisitos cubiertos:
 """
 
 import asyncio
+import json
 import logging
 import os
+import platform as _platform
 import queue as stdlib_queue
 import re
 from typing import Callable, Optional
@@ -82,6 +84,89 @@ _STEALTH_SCRIPT = r"""
   const _origReplace = location.replace.bind(location);
   location.assign  = url => url.startsWith('zoommtg://') ? null : _origAssign(url);
   location.replace = url => url.startsWith('zoommtg://') ? null : _origReplace(url);
+}
+"""
+
+# ── Script de captura de audio via Web Audio API (Linux/Railway) ─────────────
+# Inyectado como init_script ANTES de que Zoom inicialice (solo en Linux).
+# Parchea RTCPeerConnection para interceptar tracks de audio remotos.
+# ScriptProcessorNode convierte float32 → int16 PCM a 16 kHz y envía
+# chunks binarios via WebSocket al pipeline interno de Whisper.
+_CAPTURE_SCRIPT = r"""
+(wsUrl) => {
+  const SAMPLE_RATE = 16000;   // Hz requerido por Whisper
+  const BUFFER_SIZE = 1600;    // muestras → 100 ms a 16 kHz
+  const AMPLIFY     = 10.0;    // ganancia para compensar nivel bajo de WebRTC
+
+  let ws       = null;
+  let wsReady  = false;
+  const pending = [];   // buffer de chunks hasta que WS esté listo
+
+  function connectWS() {
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      wsReady = true;
+      console.log('[CaptureScript] WS conectado:', wsUrl);
+      while (pending.length) ws.send(pending.shift());
+    };
+    ws.onclose = () => {
+      wsReady = false;
+      console.warn('[CaptureScript] WS cerrado — reconectando en 2 s');
+      setTimeout(connectWS, 2000);
+    };
+    ws.onerror = (e) => console.warn('[CaptureScript] WS error:', e.type);
+  }
+  connectWS();
+
+  let audioCtx = null;
+  const connectedTracks = new Set();
+
+  function attachTrack(track) {
+    if (connectedTracks.has(track.id)) return;
+    connectedTracks.add(track.id);
+    console.log('[CaptureScript] track de audio adjuntado:', track.id);
+
+    if (!audioCtx) {
+      audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    }
+
+    const stream  = new MediaStream([track]);
+    const source  = audioCtx.createMediaStreamSource(stream);
+    const proc    = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+    proc.onaudioprocess = (e) => {
+      const f32 = e.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        const v = Math.max(-1.0, Math.min(1.0, f32[i] * AMPLIFY));
+        i16[i] = (v * 32767) | 0;
+      }
+      const buf = i16.buffer.slice(0);
+      if (wsReady && ws.readyState === 1) {
+        ws.send(buf);
+      } else if (pending.length < 200) {
+        pending.push(buf);   // conservar hasta ~20 s de buffer mientras WS reconecta
+      }
+    };
+
+    // ScriptProcessorNode necesita estar conectado a destination para disparar
+    source.connect(proc);
+    proc.connect(audioCtx.destination);
+  }
+
+  // Interceptar RTCPeerConnection de Zoom para capturar tracks entrantes
+  const _OrigPC = window.RTCPeerConnection;
+  window.RTCPeerConnection = function(...args) {
+    const pc = new _OrigPC(...args);
+    pc.addEventListener('track', (event) => {
+      if (event.track.kind === 'audio') attachTrack(event.track);
+    });
+    return pc;
+  };
+  Object.assign(window.RTCPeerConnection, _OrigPC);
+
+  console.log('[CaptureScript] inyectado — wsUrl:', wsUrl, '| esperando tracks de audio');
 }
 """
 
@@ -217,6 +302,14 @@ class ZoomBot:
         )
 
         await self._context.add_init_script(f'({_STEALTH_SCRIPT})()')
+
+        # En Linux (Railway/Docker) no hay VB-Cable: capturar audio directamente
+        # desde el RTCPeerConnection de Zoom via Web Audio API + WebSocket.
+        if _platform.system() != 'Windows':
+            ws_url_json = json.dumps(self.audio_ws_url)
+            await self._context.add_init_script(f'({_CAPTURE_SCRIPT})({ws_url_json})')
+            logger.info('[ZoomBot] Linux detectado — _CAPTURE_SCRIPT registrado (wsUrl=%s)',
+                        self.audio_ws_url)
 
         self._page = await self._context.new_page()
 
@@ -788,10 +881,15 @@ class ZoomBot:
                 self._log(f'Mic mute intento {attempt+1} falló: {e}')
         self._log(f'Estado del micrófono: {"MUTEADO ✓" if muted else "estado desconocido (probablemente muteado por &av=0)"}')
 
-        # — Iniciar captura sounddevice + monitor + heartbeat ─────────────────
-        self._set_state(IN_MEETING, 'Dentro de la reunión — iniciando captura VB-Cable')
-        self._monitoring = True
-        asyncio.create_task(self._capture_audio())
+        # — Iniciar captura + monitor + heartbeat ────────────────────────────
+        if _platform.system() == 'Windows':
+            self._set_state(IN_MEETING, 'Dentro de la reunión — iniciando captura VB-Cable')
+            self._monitoring = True
+            asyncio.create_task(self._capture_audio())
+        else:
+            self._set_state(IN_MEETING, 'Dentro de la reunión — captura audio via Web Audio API')
+            self._monitoring = True
+            asyncio.create_task(self._capture_audio_playwright())
         asyncio.create_task(self._monitor_meeting())
         asyncio.create_task(self._heartbeat())
 
@@ -807,38 +905,29 @@ class ZoomBot:
         Fallback de dispositivo: prueba _CAPTURE_DEVICE_CANDIDATES en orden;
         usa el primero que acepte 48 kHz de entrada.
         """
-        # ── Seleccionar dispositivo ────────────────────────────────────────
-        # Linux (Railway/Docker): usar dispositivo PulseAudio por defecto.
-        # Windows (local): probar índices VB-Cable en orden.
-        import platform as _platform
+        # ── Seleccionar dispositivo VB-Cable (Windows) ────────────────────
         device_idx  = None
         device_name = '?'
-        if _platform.system() != 'Windows':
-            # Linux: sounddevice usa PulseAudio automáticamente con device=None
-            device_idx  = None
-            device_name = 'PulseAudio (default)'
-            logger.info('[Capture] Linux detectado — usando PulseAudio (device=None)')
-        else:
-            for candidate in _CAPTURE_DEVICE_CANDIDATES:
-                try:
-                    sd.check_input_settings(
-                        device=candidate,
-                        channels=_CAPTURE_CHANNELS,
-                        dtype='float32',
-                        samplerate=_CAPTURE_RATE_DEVICE,
-                    )
-                    device_idx  = candidate
-                    device_name = sd.query_devices(candidate)['name']
-                    logger.info('[Capture] dispositivo seleccionado: %d — %s', candidate, device_name)
-                    break
-                except Exception as e:
-                    logger.warning('[Capture] dispositivo %d no disponible (%s) — probando siguiente',
-                                   candidate, e)
+        for candidate in _CAPTURE_DEVICE_CANDIDATES:
+            try:
+                sd.check_input_settings(
+                    device=candidate,
+                    channels=_CAPTURE_CHANNELS,
+                    dtype='float32',
+                    samplerate=_CAPTURE_RATE_DEVICE,
+                )
+                device_idx  = candidate
+                device_name = sd.query_devices(candidate)['name']
+                logger.info('[Capture] dispositivo seleccionado: %d — %s', candidate, device_name)
+                break
+            except Exception as e:
+                logger.warning('[Capture] dispositivo %d no disponible (%s) — probando siguiente',
+                               candidate, e)
 
-            if device_idx is None:
-                logger.error('[Capture] ningún dispositivo VB-Cable disponible en índices %s — abortando',
-                             _CAPTURE_DEVICE_CANDIDATES)
-                return
+        if device_idx is None:
+            logger.error('[Capture] ningún dispositivo VB-Cable disponible en índices %s — abortando',
+                         _CAPTURE_DEVICE_CANDIDATES)
+            return
 
         raw_q: stdlib_queue.Queue = stdlib_queue.Queue(maxsize=400)
 
@@ -926,6 +1015,19 @@ class ZoomBot:
                 except Exception:
                     pass
             logger.info('[Capture] detenido — %d frames enviados', frame_count)
+
+    async def _capture_audio_playwright(self) -> None:
+        """Linux: la captura ocurre en el browser via _CAPTURE_SCRIPT.
+
+        El JS inyectado intercepta RTCPeerConnection, convierte el audio track
+        remoto a PCM int16 a 16 kHz via ScriptProcessorNode, y lo envía
+        directamente al WebSocket interno. Este método solo mantiene la tarea
+        viva mientras dura la reunión.
+        """
+        logger.info('[Capture] modo Web Audio API (Linux) — captura en JS')
+        while self._monitoring:
+            await asyncio.sleep(10)
+        logger.info('[Capture] tarea Web Audio API finalizada')
 
     # ── Heartbeat ──────────────────────────────────────────────────────────
 
