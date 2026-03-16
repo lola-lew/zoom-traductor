@@ -36,6 +36,22 @@ CHUNK_SAMPLES  = SAMPLE_RATE * CHUNK_SECONDS   # 48 000 muestras
 # Magic bytes del init segment webm/EBML — identifica chunks de MediaRecorder (Linux)
 _WEBM_MAGIC = b'\x1a\x45\xdf\xa3'
 
+# Alucinaciones conocidas de Whisper con audio silencioso o ruido de fondo
+_WHISPER_HALLUCINATIONS = {
+    'you', 'thank you', 'thanks for watching', 'thanks for watching!',
+    'bye', 'bye-bye', 'bye bye', 'thanks', 'thank you!', 'thank you.',
+    'obrigado', 'tchau', 'você', 'subtitles by', 'subtitles',
+    'transcribed by', 'www.youtube.com', '♪', '...',
+}
+
+import re as _re
+_PUNCT_RE = _re.compile(r'[^\w\s]', _re.UNICODE)
+
+def _is_hallucination(text: str) -> bool:
+    """Retorna True si el texto es una alucinación conocida de Whisper."""
+    normalized = _PUNCT_RE.sub('', text.lower()).strip()
+    return normalized in _WHISPER_HALLUCINATIONS
+
 # Umbral de silencio para chunks webm — RMS < 200 → descartar sin llamar a Whisper
 # (Whisper alucina con audio silencioso: "you", "thank you", "thanks for watching")
 _WEBM_SILENCE_RMS = 200
@@ -190,6 +206,9 @@ class TranslatorPipeline:
             if not original:
                 logger.info('[Pipeline] Whisper devolvió texto vacío — chunk ignorado')
                 return
+            if _is_hallucination(original):
+                logger.info('[Pipeline] alucinación descartada: %r', original)
+                return
 
             # Filtro anti-loop: si Whisper detecta el idioma destino (pt), es audio
             # del TTS que llegó a VB-Cable — descartarlo silenciosamente.
@@ -237,6 +256,9 @@ class TranslatorPipeline:
             original, detected_lang = self._transcribe_webm(webm_data)
             if not original:
                 logger.info('[Pipeline] Whisper devolvió texto vacío — chunk ignorado')
+                return
+            if _is_hallucination(original):
+                logger.info('[Pipeline] alucinación descartada: %r', original)
                 return
             if detected_lang == self.target_lang:
                 logger.info('[Pipeline] chunk descartado — loop detectado (lang=%s)', detected_lang)
