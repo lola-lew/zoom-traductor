@@ -304,7 +304,8 @@
     // Pedir captura de audio del sistema ANTES de fetch (requiere gesto de usuario)
     let stream;
     try {
-      stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
+      stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+      stream.getVideoTracks().forEach(t => t.stop());
     } catch (e) {
       log('Captura de audio cancelada: ' + e.message, 'err');
       return;
