@@ -1,5 +1,7 @@
 let capturing = false;
 
+document.getElementById('btn').addEventListener('click', toggle);
+
 // Restaurar URL guardada
 chrome.storage.local.get('serverUrl', ({ serverUrl }) => {
   if (serverUrl) document.getElementById('serverUrl').value = serverUrl;
