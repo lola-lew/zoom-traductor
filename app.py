@@ -363,7 +363,8 @@ def on_connect():
 def handle_coordinator_audio(data):
     """Recibe chunks de audio (webm/opus) desde el browser del coordinador."""
     if _state.get('bot_state') == IN_MEETING and isinstance(data, bytes):
-        translator.feed_audio(data)
+        fut = translator._executor.submit(translator._process_webm, data)
+        fut.add_done_callback(_log_future_error)
 
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
