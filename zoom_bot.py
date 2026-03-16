@@ -340,13 +340,10 @@ class ZoomBot:
 
         await self._context.add_init_script(f'({_STEALTH_SCRIPT})()')
 
-        # En Linux (Railway/Docker) no hay VB-Cable: capturar audio directamente
-        # desde el RTCPeerConnection de Zoom via Web Audio API + WebSocket.
+        # En Linux (Railway): el audio llega del browser del coordinador via SocketIO.
+        # _CAPTURE_SCRIPT ya no es necesario — el bot solo entra a la reunión y escucha.
         if _platform.system() != 'Windows':
-            ws_url_json = json.dumps(self.audio_ws_url)
-            await self._context.add_init_script(f'({_CAPTURE_SCRIPT})({ws_url_json})')
-            logger.info('[ZoomBot] Linux detectado — _CAPTURE_SCRIPT registrado (wsUrl=%s)',
-                        self.audio_ws_url)
+            logger.info('[ZoomBot] Linux detectado — audio via coordinador (sin _CAPTURE_SCRIPT)')
 
         self._page = await self._context.new_page()
 
@@ -934,9 +931,9 @@ class ZoomBot:
             self._monitoring = True
             asyncio.create_task(self._capture_audio())
         else:
-            self._set_state(IN_MEETING, 'Dentro de la reunión — captura audio via Web Audio API')
+            self._set_state(IN_MEETING, 'Dentro de la reunión — audio via coordinador')
             self._monitoring = True
-            asyncio.create_task(self._capture_audio_playwright())
+            # Audio llega del browser del coordinador via SocketIO — sin captura local
         asyncio.create_task(self._monitor_meeting())
         asyncio.create_task(self._heartbeat())
 

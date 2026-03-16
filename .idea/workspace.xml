@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="0ceed5e9-5838-435d-9fc2-1028cadf63da" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/zoom_bot.py" beforeDir="false" afterPath="$PROJECT_DIR$/zoom_bot.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

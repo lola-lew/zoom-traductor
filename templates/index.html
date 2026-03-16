@@ -254,7 +254,9 @@
 
 <script>
   const socket = io();
-  let running  = false;
+  let running          = false;
+  let _captureStream   = null;
+  let _captureRecorder = null;
 
   document.getElementById('listenLink').value = location.origin + '/listen';
 
@@ -275,10 +277,11 @@
   socket.on('status_change', ({ state, message }) => {
     setStateBadge(state);
     if (message) log(message, state === 'error' || state === 'disconnected' ? 'err' : '');
-    // Si el bot se desconectó externamente, sincronizar el botón
+    // Si el bot se desconectó externamente, sincronizar el botón y detener captura
     if ((state === 'disconnected' || state === 'idle') && running) {
       running = false;
       updateBtn();
+      _stopCapture();
     }
   });
 
@@ -292,48 +295,81 @@
   // ── Control ───────────────────────────────────────────────────────────────
   function toggle() { running ? stopBot() : startBot(); }
 
-  function startBot() {
+  async function startBot() {
     const meetingUrl = document.getElementById('meetingId').value.trim();
     const targetLang = document.getElementById('targetLang').value;
 
     if (!meetingUrl) { log('Ingresá el link de la reunión Zoom', 'err'); return; }
 
-    const payload = { meeting_url: meetingUrl, target_lang: targetLang };
-    console.log('[startBot] enviando POST /start', payload);
-    log(`Enviando → meeting_url="${meetingUrl}" lang="${targetLang}"`);
+    // Pedir captura de audio del sistema ANTES de fetch (requiere gesto de usuario)
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
+    } catch (e) {
+      log('Captura de audio cancelada: ' + e.message, 'err');
+      return;
+    }
 
     setBtn(true);
+    log(`Enviando → meeting_url="${meetingUrl}" lang="${targetLang}"`);
 
-    fetch('/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    .then(r => {
-      console.log('[startBot] respuesta HTTP', r.status);
-      log(`Respuesta HTTP: ${r.status}`);
-      return r.json().then(d => ({ status: r.status, data: d }));
-    })
-    .then(({ status, data }) => {
+    try {
+      const r    = await fetch('/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meeting_url: meetingUrl, target_lang: targetLang }),
+      });
+      const data = await r.json();
       if (data.error) {
-        log(`Error ${status}: ${data.error}`, 'err');
-        setBtn(false);
+        log(`Error ${r.status}: ${data.error}`, 'err');
+        stream.getTracks().forEach(t => t.stop());
       } else {
         log(`OK — meeting ${data.meeting_id || meetingUrl} iniciado`, 'ok');
         running = true;
         updateBtn();
-        setBtn(false);
+        _startMediaRecorder(stream);
       }
-    })
-    .catch(e => {
+    } catch (e) {
       console.error('[startBot] fetch error:', e);
       log('Error de red: ' + e, 'err');
+      stream.getTracks().forEach(t => t.stop());
+    } finally {
       setBtn(false);
+    }
+  }
+
+  function _startMediaRecorder(stream) {
+    _captureStream = stream;
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus' : '';
+    _captureRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+
+    _captureRecorder.ondataavailable = async (e) => {
+      if (e.data.size === 0) return;
+      const buf = await e.data.arrayBuffer();
+      socket.emit('coordinator_audio', buf);
+    };
+
+    _captureRecorder.onerror = (e) => log('MediaRecorder error: ' + e.error?.message, 'err');
+    _captureRecorder.start(3000);  // chunk cada 3 s
+    log('Captura de audio del sistema iniciada', 'ok');
+
+    // Detener si el usuario cierra el share desde el browser
+    stream.getAudioTracks()[0]?.addEventListener('ended', () => {
+      if (running) { log('Captura de audio interrumpida', 'err'); stopBot(); }
     });
+  }
+
+  function _stopCapture() {
+    if (_captureRecorder && _captureRecorder.state !== 'inactive') _captureRecorder.stop();
+    if (_captureStream) _captureStream.getTracks().forEach(t => t.stop());
+    _captureRecorder = null;
+    _captureStream   = null;
   }
 
   function stopBot() {
     setBtn(true);
+    _stopCapture();
     fetch('/stop', { method: 'POST' })
       .then(r => r.json())
       .then(d => { log(d.error ? d.error : 'Sesión detenida', d.error ? 'err' : 'ok'); })

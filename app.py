@@ -359,6 +359,13 @@ def on_connect():
     emit('status_change', {'state': _state['bot_state'], 'message': ''})
 
 
+@socketio.on('coordinator_audio')
+def handle_coordinator_audio(data):
+    """Recibe chunks de audio (webm/opus) desde el browser del coordinador."""
+    if _state.get('bot_state') == IN_MEETING and isinstance(data, bytes):
+        translator.feed_audio(data)
+
+
 # ── Arranque ──────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
