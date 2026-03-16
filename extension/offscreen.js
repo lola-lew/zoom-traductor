@@ -6,6 +6,7 @@
 
 let _recorder    = null;
 let _stream      = null;
+let _audioCtx    = null;
 let _ws          = null;
 let _wsUrl       = null;
 let _active      = false;
@@ -45,6 +46,11 @@ async function startCapture(streamId, serverUrl) {
     },
     video: false,
   });
+
+  // Reconectar audio a los parlantes: tabCapture silencia la pestaña al capturar
+  _audioCtx = new AudioContext();
+  const source = _audioCtx.createMediaStreamSource(_stream);
+  source.connect(_audioCtx.destination);
 
   // Notificar al background si el stream se interrumpe (pestaña cerrada, etc.)
   _stream.getAudioTracks()[0]?.addEventListener('ended', () => {
@@ -89,8 +95,9 @@ function stopCapture() {
   _pingTimer = null;
 
   if (_recorder && _recorder.state !== 'inactive') _recorder.stop();
-  if (_stream) _stream.getTracks().forEach(t => t.stop());
-  if (_ws)     { _ws.close(); _ws = null; }
+  if (_stream)   _stream.getTracks().forEach(t => t.stop());
+  if (_audioCtx) { _audioCtx.close(); _audioCtx = null; }
+  if (_ws)       { _ws.close(); _ws = null; }
 
   _recorder    = null;
   _stream      = null;

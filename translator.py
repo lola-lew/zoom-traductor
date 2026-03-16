@@ -17,6 +17,8 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
+import numpy as np
+
 from openai import (
     APIConnectionError,
     APITimeoutError,
@@ -33,6 +35,10 @@ CHUNK_SAMPLES  = SAMPLE_RATE * CHUNK_SECONDS   # 48 000 muestras
 
 # Magic bytes del init segment webm/EBML — identifica chunks de MediaRecorder (Linux)
 _WEBM_MAGIC = b'\x1a\x45\xdf\xa3'
+
+# Umbral de silencio para chunks webm — RMS < 200 → descartar sin llamar a Whisper
+# (Whisper alucina con audio silencioso: "you", "thank you", "thanks for watching")
+_WEBM_SILENCE_RMS = 200
 
 # Detección de silencio
 # RMS int16: silencio puro ≈ 0, ruido/fake device ≈ 100-500, voz normal ≈ 500+
@@ -207,9 +213,26 @@ class TranslatorPipeline:
             if self.on_error:
                 self.on_error(str(exc))
 
+    def _rms_webm(self, webm_data: bytes) -> float:
+        """Decodifica webm a PCM con pydub y calcula RMS. Retorna 0.0 si falla."""
+        try:
+            from pydub import AudioSegment  # import lazy — solo si está instalado
+            seg = AudioSegment.from_file(io.BytesIO(webm_data), format='webm')
+            samples = np.array(seg.get_array_of_samples(), dtype=np.float64)
+            if samples.size == 0:
+                return 0.0
+            return float(np.sqrt(np.mean(samples ** 2)))
+        except Exception as e:
+            logger.debug('[Pipeline] rms_webm error (asumiendo audio): %s', e)
+            return float('inf')  # si no se puede decodificar, dejar pasar
+
     def _process_webm(self, webm_data: bytes) -> None:
-        """Ruta Linux: procesa un chunk webm/opus de MediaRecorder sin buffer PCM."""
-        logger.info('[Pipeline] WEBM chunk — %d bytes — llamando Whisper API...', len(webm_data))
+        """Ruta webm/opus: procesa un chunk de MediaRecorder."""
+        rms = self._rms_webm(webm_data)
+        if rms < _WEBM_SILENCE_RMS:
+            logger.info('[Pipeline] WEBM silencioso (RMS=%.0f) — descartado', rms)
+            return
+        logger.info('[Pipeline] WEBM chunk — %d bytes, RMS=%.0f — llamando Whisper...', len(webm_data), rms)
         try:
             original, detected_lang = self._transcribe_webm(webm_data)
             if not original:
