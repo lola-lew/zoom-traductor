@@ -1,11 +1,24 @@
 let _capturing  = false;
 let _serverUrl  = null;
+let _lastError  = null;  // error pendiente de mostrar en el popup
 
-// ── Mensajes desde popup ──────────────────────────────────────────────────────
+// ── Mensajes desde popup y offscreen ─────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'status') {
-    sendResponse({ capturing: _capturing });
+    const err = _lastError;
+    _lastError = null;           // consumir el error al leerlo
+    sendResponse({ capturing: _capturing, error: err });
+    return;
+  }
+
+  // Notificación de error desde offscreen (stream interrumpido, recorder error)
+  if (msg.action === 'offscreen_error') {
+    console.error('[bg] error desde offscreen:', msg.error);
+    _lastError  = msg.error || 'Error de captura';
+    _capturing  = false;
+    _serverUrl  = null;
+    closeOffscreen().catch(() => {});
     return;
   }
 

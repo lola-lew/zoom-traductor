@@ -11,6 +11,7 @@ chrome.storage.local.get('serverUrl', ({ serverUrl }) => {
 chrome.runtime.sendMessage({ action: 'status' }, (resp) => {
   if (chrome.runtime.lastError) return;
   if (resp?.capturing) setCapturing(true, 'Capturando...');
+  if (resp?.error)     setStatus('Error: ' + resp.error, 'err');
 });
 
 function toggle() {

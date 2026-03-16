@@ -20,6 +20,7 @@ from typing import Optional
 import websockets
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
+from flask_sock import Sock
 from flask_socketio import SocketIO, emit
 from playwright.async_api import async_playwright
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'zoom-traductor-dev')
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
+sock = Sock(app)
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
@@ -359,12 +361,30 @@ def on_connect():
     emit('status_change', {'state': _state['bot_state'], 'message': ''})
 
 
-@socketio.on('coordinator_audio')
-def handle_coordinator_audio(data):
-    """Recibe chunks de audio (webm/opus) desde el browser del coordinador."""
-    if _state.get('bot_state') == IN_MEETING and isinstance(data, bytes):
-        fut = translator._executor.submit(translator._process_webm, data)
-        fut.add_done_callback(_log_future_error)
+@sock.route('/coordinator_ws')
+def coordinator_ws(ws):
+    """WebSocket puro: recibe chunks webm/opus desde la extensión Chrome."""
+    chunk_count = 0
+    logger.info('[CoordinatorWS] coordinador conectado')
+    try:
+        while True:
+            data = ws.receive()
+            if data is None:
+                break
+            if not isinstance(data, bytes):
+                continue  # ping de keepalive (texto) — ignorar
+            chunk_count += 1
+            if _state.get('bot_state') != IN_MEETING:
+                if chunk_count % 20 == 1:
+                    logger.debug('[CoordinatorWS] chunk descartado — bot_state=%s',
+                                 _state.get('bot_state'))
+                continue
+            if chunk_count % 10 == 1:
+                logger.info('[CoordinatorWS] chunk #%d — %d bytes', chunk_count, len(data))
+            translator._executor.submit(translator._process_webm, data)
+    except Exception as exc:
+        logger.warning('[CoordinatorWS] desconectado: %s', exc)
+    logger.info('[CoordinatorWS] coordinador desconectado — %d chunks procesados', chunk_count)
 
 
 # ── Arranque ──────────────────────────────────────────────────────────────────

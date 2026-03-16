@@ -1,17 +1,16 @@
 /**
- * Offscreen document: corre el MediaRecorder y el cliente SocketIO.
- * Vive mientras la captura está activa; el background lo destruye al detener.
- *
- * Protocolo: SocketIO v4 / Engine.IO v4 implementado manualmente sobre WebSocket
- * (sin dependencias externas). Envía chunks de audio como binary events.
+ * Offscreen document: MediaRecorder + WebSocket puro hacia /coordinator_ws.
+ * Mantiene la conexión viva con pings cada 20 s y reconecta con backoff de 3 s.
+ * Prepend del init segment en cada chunk para que Whisper reciba webm válido.
  */
 
-let _recorder   = null;
-let _stream     = null;
-let _ws         = null;
-let _wsReady    = false;
-let _active     = false;
-let _serverUrl  = null;
+let _recorder    = null;
+let _stream      = null;
+let _ws          = null;
+let _wsUrl       = null;
+let _active      = false;
+let _initSegment = null;   // primer chunk = cabecera EBML — se prepend a todos los demás
+let _pingTimer   = null;
 
 // ── Mensajes desde background ─────────────────────────────────────────────────
 
@@ -32,12 +31,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ── Captura ───────────────────────────────────────────────────────────────────
 
 async function startCapture(streamId, serverUrl) {
-  _active    = true;
-  _serverUrl = serverUrl;
+  _active  = true;
+  _wsUrl   = serverUrl.replace(/^https?/, 'wss').replace(/\/+$/, '') + '/coordinator_ws';
 
-  connectWS(serverUrl);
+  connectWS();
 
-  // getUserMedia con el stream ID obtenido por tabCapture en el background
   _stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       mandatory: {
@@ -48,91 +46,105 @@ async function startCapture(streamId, serverUrl) {
     video: false,
   });
 
+  // Notificar al background si el stream se interrumpe (pestaña cerrada, etc.)
+  _stream.getAudioTracks()[0]?.addEventListener('ended', () => {
+    console.warn('[offscreen] audio track ended — notificando al background');
+    chrome.runtime.sendMessage({ action: 'offscreen_error', error: 'Audio track interrumpido' });
+    stopCapture();
+  });
+
   const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
     ? 'audio/webm;codecs=opus' : '';
   _recorder = new MediaRecorder(_stream, mimeType ? { mimeType } : {});
 
+  let isFirstChunk = true;
   _recorder.ondataavailable = async (e) => {
     if (e.data.size === 0) return;
     const buf = await e.data.arrayBuffer();
-    sendAudioChunk(buf);
+
+    if (isFirstChunk) {
+      // Guardar init segment (cabecera EBML) — se prepend a cada chunk siguiente
+      _initSegment = buf;
+      isFirstChunk = false;
+      console.log('[offscreen] init segment guardado — %d bytes', buf.byteLength);
+      // No enviar el init segment solo; esperar al primer chunk real
+      return;
+    }
+
+    sendChunk(buf);
   };
 
-  _recorder.onerror = (e) => console.error('[offscreen] recorder error:', e.error?.message);
-  _recorder.start(3000); // chunk cada 3 s
+  _recorder.onerror = (e) => {
+    console.error('[offscreen] recorder error:', e.error?.message);
+    chrome.runtime.sendMessage({ action: 'offscreen_error', error: e.error?.message || 'MediaRecorder error' });
+  };
+
+  _recorder.start(5000); // chunk cada 5 s
   console.log('[offscreen] MediaRecorder started — mimeType:', _recorder.mimeType);
 }
 
 function stopCapture() {
   _active = false;
+  clearInterval(_pingTimer);
+  _pingTimer = null;
+
   if (_recorder && _recorder.state !== 'inactive') _recorder.stop();
   if (_stream) _stream.getTracks().forEach(t => t.stop());
   if (_ws)     { _ws.close(); _ws = null; }
-  _recorder = null;
-  _stream   = null;
-  _wsReady  = false;
+
+  _recorder    = null;
+  _stream      = null;
+  _initSegment = null;
 }
 
-// ── Mini cliente SocketIO v4 (Engine.IO v4) ───────────────────────────────────
-//
-// SocketIO v4 sobre WebSocket — protocolo en texto + frames binarios:
-//   EIO tipos: 0=open  2=ping  3=pong  4=message  (todo texto excepto attachment)
-//   SIO tipos (dentro de EIO message "4"): 0=connect  2=event  5=binary_event
-//
-// Para emitir un binary event con 1 attachment:
-//   → Frame texto: "451-["coordinator_audio",{"_placeholder":true,"num":0}]"
-//   → Frame binario: <ArrayBuffer>
-//
-// El servidor Flask-SocketIO (python-socketio ≥5 / EIO=4) entiende este formato.
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 
-function connectWS(serverUrl) {
+function connectWS() {
   if (!_active) return;
 
-  const wsUrl = serverUrl.replace(/^https?/, 'wss').replace(/\/+$/, '')
-    + '/socket.io/?EIO=4&transport=websocket';
-
-  console.log('[offscreen] conectando a', wsUrl);
-  _ws = new WebSocket(wsUrl);
+  console.log('[offscreen] conectando a', _wsUrl);
+  _ws = new WebSocket(_wsUrl);
   _ws.binaryType = 'arraybuffer';
 
-  _ws.onopen = () => console.log('[offscreen] WS abierto');
-
-  _ws.onmessage = (e) => {
-    if (typeof e.data !== 'string') return;
-    const pkt = e.data;
-
-    if (pkt.startsWith('0')) {
-      // EIO open → responder con SIO connect
-      _ws.send('40');
-    } else if (pkt === '2') {
-      // EIO ping → pong
-      _ws.send('3');
-    } else if (pkt.startsWith('40')) {
-      // SIO connected al namespace /
-      _wsReady = true;
-      console.log('[offscreen] SocketIO conectado');
-    } else if (pkt.startsWith('41')) {
-      _wsReady = false;
-    }
+  _ws.onopen = () => {
+    console.log('[offscreen] WS conectado');
+    // Ping cada 20 s para mantener la conexión viva en Railway
+    clearInterval(_pingTimer);
+    _pingTimer = setInterval(() => {
+      if (_ws && _ws.readyState === WebSocket.OPEN) {
+        _ws.send('ping');
+      }
+    }, 20_000);
   };
 
   _ws.onclose = () => {
-    _wsReady = false;
+    clearInterval(_pingTimer);
+    _pingTimer = null;
     if (_active) {
       console.log('[offscreen] WS cerrado — reconectando en 3 s');
-      setTimeout(() => connectWS(_serverUrl), 3000);
+      setTimeout(connectWS, 3000);
     }
   };
 
   _ws.onerror = () => console.warn('[offscreen] WS error');
 }
 
-function sendAudioChunk(buffer) {
-  if (!_wsReady || !_ws || _ws.readyState !== WebSocket.OPEN) {
-    console.warn('[offscreen] WS no listo — chunk descartado (%d bytes)', buffer.byteLength);
+// ── Envío de chunks ───────────────────────────────────────────────────────────
+
+function sendChunk(buf) {
+  if (!_ws || _ws.readyState !== WebSocket.OPEN) {
+    console.warn('[offscreen] WS no listo — chunk descartado (%d bytes)', buf.byteLength);
     return;
   }
-  // Binary event con 1 attachment
-  _ws.send('451-["coordinator_audio",{"_placeholder":true,"num":0}]');
-  _ws.send(buffer);
+
+  // Prepend init segment para que cada chunk sea un webm válido standalone
+  let payload = buf;
+  if (_initSegment) {
+    const combined = new Uint8Array(_initSegment.byteLength + buf.byteLength);
+    combined.set(new Uint8Array(_initSegment), 0);
+    combined.set(new Uint8Array(buf), _initSegment.byteLength);
+    payload = combined.buffer;
+  }
+
+  _ws.send(payload);
 }
