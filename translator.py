@@ -42,6 +42,7 @@ _WHISPER_HALLUCINATIONS = {
     'bye', 'bye-bye', 'bye bye', 'thanks', 'thank you!', 'thank you.',
     'obrigado', 'tchau', 'você', 'subtitles by', 'subtitles',
     'transcribed by', 'www.youtube.com', '♪', '...',
+    'gracias por ver', 'gracias por vernos',
 }
 
 import re as _re

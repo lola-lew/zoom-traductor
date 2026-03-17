@@ -1,4 +1,4 @@
-let capturing = false;
+claudelet capturing = false;
 
 document.getElementById('btn').addEventListener('click', toggle);
 
