@@ -381,7 +381,7 @@ def coordinator_ws(ws):
                 continue
             if chunk_count % 10 == 1:
                 logger.info('[CoordinatorWS] chunk #%d — %d bytes', chunk_count, len(data))
-            translator._executor.submit(translator._process_webm, data)
+            translator.feed_audio(data)
     except Exception as exc:
         logger.warning('[CoordinatorWS] desconectado: %s', exc)
     logger.info('[CoordinatorWS] coordinador desconectado — %d chunks procesados', chunk_count)

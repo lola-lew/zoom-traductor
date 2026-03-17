@@ -14,7 +14,7 @@ import threading
 import tkinter as tk
 
 import numpy as np
-import pyaudio
+import pyaudiowpatch as pyaudio
 import websocket  # websocket-client
 
 # ── Constantes ────────────────────────────────────────────────────────────────
