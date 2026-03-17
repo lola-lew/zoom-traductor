@@ -137,10 +137,12 @@ def _capture_thread():
                     continue  # silencio — descartar
 
                 chunk_i16 = (chunk_f32 * 32767).clip(-32768, 32767).astype(np.int16)
+                chunk_bytes = chunk_i16.tobytes()
                 try:
-                    _audio_q.put_nowait(chunk_i16.tobytes())
+                    _audio_q.put_nowait(chunk_bytes)
+                    print(f'[Capture] chunk encolado — RMS={rms:.4f} len={len(chunk_bytes)} qsize={_audio_q.qsize()}')
                 except queue.Full:
-                    pass  # WS lento — descartar chunk más viejo
+                    print(f'[Capture] COLA LLENA — chunk descartado, qsize={_audio_q.qsize()}')
     finally:
         stream.stop_stream()
         stream.close()
@@ -156,14 +158,19 @@ def _ws_thread(url: str):
     def on_open(ws):
         _set_status('Conectado — enviando audio', 'green')
 
+        _send_count = 0
         def _sender():
+            nonlocal _send_count
             while _running and ws.sock and ws.sock.connected:
                 try:
                     chunk = _audio_q.get(timeout=0.5)
                     ws.send_binary(chunk)
+                    _send_count += 1
+                    print(f'[WS] chunk #{_send_count} enviado — {len(chunk)} bytes')
                 except queue.Empty:
                     pass
-                except Exception:
+                except Exception as e:
+                    print(f'[WS] error en sender: {e}')
                     break
         threading.Thread(target=_sender, daemon=True).start()
 

@@ -365,15 +365,23 @@ def on_connect():
 def coordinator_ws(ws):
     """WebSocket puro: recibe chunks webm/opus desde la extensión Chrome."""
     chunk_count = 0
-    logger.info('[CoordinatorWS] coordinador conectado')
+    logger.info('[CoordinatorWS] coordinador conectado — bot_state=%s running=%s',
+                _state.get('bot_state'), _state.get('running'))
     try:
         while True:
             data = ws.receive()
             if data is None:
+                logger.info('[CoordinatorWS] receive() retornó None — cerrando')
                 break
             if not isinstance(data, bytes):
+                logger.info('[CoordinatorWS] DIAGNÓSTICO: recibido tipo=%s len=%d primeros_bytes=%r',
+                            type(data).__name__, len(data) if data else 0,
+                            data[:80] if data else '')
                 continue  # ping de keepalive (texto) — ignorar
             chunk_count += 1
+            if chunk_count == 1:
+                logger.info('[CoordinatorWS] PRIMER chunk binario recibido — %d bytes, bot_state=%s',
+                            len(data), _state.get('bot_state'))
             if _state.get('bot_state') != IN_MEETING:
                 if chunk_count % 20 == 1:
                     logger.debug('[CoordinatorWS] chunk descartado — bot_state=%s',
