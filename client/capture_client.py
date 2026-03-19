@@ -16,6 +16,7 @@ import tkinter as tk
 import numpy as np
 import pyaudiowpatch as pyaudio
 import websocket  # websocket-client
+from websocket import ABNF
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
@@ -161,10 +162,10 @@ def _ws_thread(url: str):
         _send_count = 0
         def _sender():
             nonlocal _send_count
-            while _running and ws.sock and ws.sock.connected:
+            while _running:
                 try:
                     chunk = _audio_q.get(timeout=0.5)
-                    ws.send_binary(chunk)
+                    ws.send(chunk, ABNF.OPCODE_BINARY)
                     _send_count += 1
                     print(f'[WS] chunk #{_send_count} enviado — {len(chunk)} bytes')
                 except queue.Empty:
