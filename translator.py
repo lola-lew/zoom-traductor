@@ -43,6 +43,17 @@ _WHISPER_HALLUCINATIONS = {
     'obrigado', 'tchau', 'você', 'subtitles by', 'subtitles',
     'transcribed by', 'www.youtube.com', '♪', '...',
     'gracias por ver', 'gracias por vernos',
+    # Alucinaciones frecuentes en portugués con silencio/ruido
+    'olá como vocês estão bemvindos', 'olá como vocês estão',
+    'bemvindos', 'bem vindos', 'obrigada',
+    'abra o coração', 'abra a boca', 'abra o coração abra a boca',
+    'abra o coraçao', 'abra o coração abra o coração abra a boca',
+    'olá', 'olá olá', 'ok', 'sim', 'não',
+    # Alucinaciones en español
+    'hola', 'hola hola', 'gracias', 'adiós', 'chao', 'chao chao',
+    'bienvenidos', 'bien', 'sí', 'no',
+    # Alucinaciones en inglés con música/ruido
+    'singing off fate', 'music', 'applause',
 }
 
 import re as _re
@@ -58,9 +69,9 @@ def _is_hallucination(text: str) -> bool:
 _WEBM_SILENCE_RMS = 200
 
 # Detección de silencio
-# RMS int16: silencio puro ≈ 0, ruido/fake device ≈ 100-500, voz normal ≈ 500+
-# Umbral conservador para filtrar silencio sin cortar voz real.
-SILENCE_THRESHOLD = 50
+# RMS int16: silencio puro ≈ 0, ruido de fondo ≈ 100-400, voz normal ≈ 500+
+# Umbral subido a 400 para evitar alucinaciones de Whisper con audio muy bajo.
+SILENCE_THRESHOLD = 400
 SILENCE_LOG_S     = 30   # loguear (pero no enviar) si hay silencio continuo
 
 # Reintentos en errores transitorios de OpenAI
@@ -126,6 +137,10 @@ class TranslatorPipeline:
         # Contadores de silencio (accedidos solo desde threads del executor)
         self._silent_samples_acc = 0   # muestras silenciosas acumuladas
 
+        # Deduplicación: evita emitir la misma frase repetida seguida
+        self._last_transcriptions: list[str] = []   # últimas N transcripciones
+        self._dedup_lock = threading.Lock()
+
         # Callbacks
         self.on_translation: Optional[Callable[[str, str, str], None]] = None
         self.on_error:       Optional[Callable[[str], None]]            = None
@@ -137,6 +152,8 @@ class TranslatorPipeline:
         with self._lock:
             self._buffer = []
         self._silent_samples_acc = 0
+        with self._dedup_lock:
+            self._last_transcriptions = []
         self._running = True
         logger.info('TranslatorPipeline iniciado (lang=%s)', target_lang)
 
@@ -203,22 +220,40 @@ class TranslatorPipeline:
 
             wav_data   = _samples_to_wav(samples)
             logger.info('[Pipeline] WAV preparado (%d bytes) — llamando Whisper API...', len(wav_data))
-            original, detected_lang = self._transcribe(wav_data)
+            original, detected_lang, no_speech_prob = self._transcribe(wav_data)
             if not original:
                 logger.info('[Pipeline] Whisper devolvió texto vacío — chunk ignorado')
                 return
+
+            # Filtro no_speech_prob: Whisper indica que probablemente no hay voz
+            if no_speech_prob > 0.6:
+                logger.info('[Pipeline] chunk descartado — no_speech_prob=%.2f (probable silencio/ruido)',
+                            no_speech_prob)
+                return
+
             if _is_hallucination(original):
                 logger.info('[Pipeline] alucinación descartada: %r', original)
                 return
 
-            # Filtro anti-loop: si Whisper detecta el idioma destino (pt), es audio
-            # del TTS que llegó a VB-Cable — descartarlo silenciosamente.
-            if detected_lang == self.target_lang:
-                logger.info('[Pipeline] chunk descartado — idioma detectado=%r coincide con target_lang=%r (loop)',
+            # Filtro anti-loop: si Whisper detecta el idioma destino, es audio del TTS
+            # que volvió por el loopback. También filtramos español/portugués por similitud.
+            _LOOP_LANGS = {self.target_lang, 'pt', 'es'} if self.target_lang in ('pt', 'es') else {self.target_lang}
+            if detected_lang in _LOOP_LANGS:
+                logger.info('[Pipeline] chunk descartado — idioma detectado=%r posible loop TTS (target=%r)',
                             detected_lang, self.target_lang)
                 return
 
-            logger.info('[Pipeline] Whisper OK: %r (lang=%s)', original, detected_lang)
+            # Deduplicación: descartar si es igual a alguna de las últimas 3 transcripciones
+            normalized = _PUNCT_RE.sub('', original.lower()).strip()
+            with self._dedup_lock:
+                if normalized in self._last_transcriptions:
+                    logger.info('[Pipeline] chunk descartado — duplicado reciente: %r', original)
+                    return
+                self._last_transcriptions.append(normalized)
+                if len(self._last_transcriptions) > 3:
+                    self._last_transcriptions.pop(0)
+
+            logger.info('[Pipeline] Whisper OK: %r (lang=%s, no_speech=%.2f)', original, detected_lang, no_speech_prob)
             translated = self._translate(original)
             logger.info('[Pipeline] GPT OK: %r', translated)
             audio_b64  = self._tts(translated)
@@ -289,15 +324,21 @@ class TranslatorPipeline:
             return t.text.strip(), (t.language or '').lower()
         return _retry(_call, 'Whisper')
 
-    def _transcribe(self, wav_data: bytes) -> tuple[str, str]:
-        """Devuelve (text, language). language es el código ISO detectado por Whisper."""
+    def _transcribe(self, wav_data: bytes) -> tuple[str, str, float]:
+        """Devuelve (text, language, no_speech_prob). no_speech_prob: 0.0=voz, 1.0=silencio."""
         def _call():
             t = self._client.audio.transcriptions.create(
                 model='whisper-1',
                 file=('chunk.wav', wav_data, 'audio/wav'),
                 response_format='verbose_json',
             )
-            return t.text.strip(), (t.language or '').lower()
+            # no_speech_prob: promedio de segmentos (0.0 = voz clara, 1.0 = silencio)
+            segs = getattr(t, 'segments', None) or []
+            if segs:
+                avg_nsp = sum(s.get('no_speech_prob', 0) for s in segs) / len(segs)
+            else:
+                avg_nsp = 0.0
+            return t.text.strip(), (t.language or '').lower(), avg_nsp
         return _retry(_call, 'Whisper')
 
     def _translate(self, text: str) -> str:

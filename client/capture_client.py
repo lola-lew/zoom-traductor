@@ -23,7 +23,7 @@ from websocket import ABNF
 TARGET_RATE     = 16000
 CHUNK_SECONDS   = 3
 CHUNK_SAMPLES   = TARGET_RATE * CHUNK_SECONDS   # 48 000 muestras por chunk
-RMS_THRESHOLD   = 0.01                          # float32; < umbral → silencio, descartar
+RMS_THRESHOLD   = 0.02                          # float32; < umbral → silencio, descartar
 DEFAULT_URL     = 'wss://web-production-a6d81.up.railway.app/coordinator_ws'
 RECONNECT_DELAY = 3                             # segundos entre reintentos WS
 
