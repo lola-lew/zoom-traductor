@@ -2,8 +2,15 @@
 Zoom Tradutor — Cliente de captura de audio para el coordinador.
 
 Captura el audio del speaker (WASAPI loopback) con pyaudiowpatch,
-resamplea a 16 kHz mono, descarta silencio (RMS float32 < 0.01) y
-envía chunks PCM int16 de 3 s via WebSocket a Railway.
+resamplea a 16 kHz mono y usa VAD basado en energía (frames de 30 ms)
+para detectar pausas naturales del habla. Envía cada enunciado completo
+como un chunk PCM int16 via WebSocket a Railway.
+
+Lógica VAD:
+  - Procesa el audio en frames de 30 ms
+  - Acumula frames mientras hay voz (RMS >= RMS_THRESHOLD)
+  - Cuando detecta 1 s de silencio tras voz → envía el enunciado
+  - Mínimo 0.5 s de voz para enviar; máximo 12 s (forzado)
 
 Compilar como .exe:
     pyinstaller --onefile --windowed --name ZoomTradutor capture_client.py
@@ -21,11 +28,16 @@ from websocket import ABNF
 # ── Constantes ────────────────────────────────────────────────────────────────
 
 TARGET_RATE     = 16000
-CHUNK_SECONDS   = 3
-CHUNK_SAMPLES   = TARGET_RATE * CHUNK_SECONDS   # 48 000 muestras por chunk
-RMS_THRESHOLD   = 0.015                         # float32; < umbral → silencio, descartar
+RMS_THRESHOLD   = 0.015          # float32; < umbral → silencio
 DEFAULT_URL     = 'wss://web-production-a6d81.up.railway.app/coordinator_ws'
-RECONNECT_DELAY = 3                             # segundos entre reintentos WS
+RECONNECT_DELAY = 3              # segundos entre reintentos WS
+
+# VAD — detección de pausas naturales del habla
+FRAME_MS           = 30                                      # duración de cada frame
+FRAME_SAMPLES      = int(TARGET_RATE * FRAME_MS / 1000)      # 480 muestras @ 16 kHz
+SILENCE_FRAMES_END = int(1.0 / (FRAME_MS / 1000))            # 33 frames ≈ 1 s de silencio → enviar
+MIN_SPEECH_SAMPLES = int(TARGET_RATE * 0.5)                  # mínimo 0.5 s de voz para enviar
+MAX_SPEECH_SAMPLES = int(TARGET_RATE * 12)                   # máximo 12 s → enviar aunque no haya pausa
 
 # ── Estado compartido ─────────────────────────────────────────────────────────
 
@@ -82,8 +94,28 @@ def _find_loopback_device(p: pyaudio.PyAudio):
 
 # ── Hilo de captura de audio ──────────────────────────────────────────────────
 
+def _enqueue_utterance(speech_buf: np.ndarray, label: str) -> None:
+    """Convierte un array float32 de un enunciado completo a PCM int16 y lo encola."""
+    rms = _rms_f32(speech_buf)
+    chunk_i16   = (speech_buf * 32767).clip(-32768, 32767).astype(np.int16)
+    chunk_bytes = chunk_i16.tobytes()
+    try:
+        _audio_q.put_nowait(chunk_bytes)
+        print(f'[Capture] {label} — RMS={rms:.4f} dur={len(speech_buf)/TARGET_RATE:.2f}s '
+              f'len={len(chunk_bytes)} qsize={_audio_q.qsize()}')
+    except queue.Full:
+        print(f'[Capture] COLA LLENA — {label} descartado, qsize={_audio_q.qsize()}')
+
+
 def _capture_thread():
-    """Captura WASAPI loopback, resamplea a 16 kHz mono y llena _audio_q."""
+    """
+    Captura WASAPI loopback, resamplea a 16 kHz mono y aplica VAD basado en energía.
+
+    Procesa el audio en frames de 30 ms. Acumula frames de voz en speech_buf.
+    Cuando detecta SILENCE_FRAMES_END frames consecutivos de silencio tras voz,
+    envía el enunciado acumulado como un chunk completo. Esto alinea los chunks
+    con las pausas naturales del habla en lugar de cortar cada 3 s fijos.
+    """
     p = pyaudio.PyAudio()
     try:
         dev_idx, dev_info = _find_loopback_device(p)
@@ -92,9 +124,9 @@ def _capture_thread():
         p.terminate()
         return
 
-    native_rate = int(dev_info['defaultSampleRate'])
-    native_ch   = max(1, dev_info.get('maxInputChannels', 2))
-    frames_per_read = int(native_rate * 0.05)   # bloques de ~50 ms
+    native_rate     = int(dev_info['defaultSampleRate'])
+    native_ch       = max(1, dev_info.get('maxInputChannels', 2))
+    frames_per_read = int(native_rate * FRAME_MS / 1000)   # bloques de 30 ms nativos
 
     stream = p.open(
         format=pyaudio.paFloat32,
@@ -106,17 +138,24 @@ def _capture_thread():
     )
 
     _set_status('Capturando...', 'green')
-    buf = np.empty(0, dtype=np.float32)
+
+    # Buffer de resampleo (puede acumular fracciones de frame por diferencia de rates)
+    resample_buf = np.empty(0, dtype=np.float32)
+
+    # Estado VAD
+    speech_buf     = np.empty(0, dtype=np.float32)   # enunciado en construcción
+    in_speech      = False
+    silence_frames = 0
 
     try:
         while _running:
-            raw  = stream.read(frames_per_read, exception_on_overflow=False)
+            raw   = stream.read(frames_per_read, exception_on_overflow=False)
             frame = np.frombuffer(raw, dtype=np.float32).reshape(-1, native_ch)
 
             # Mezclar canales → mono
             mono = frame.mean(axis=1)
 
-            # Resamplear native_rate → 16 kHz
+            # Resamplear native_rate → 16 kHz si hace falta
             if native_rate != TARGET_RATE:
                 n_out = int(len(mono) * TARGET_RATE / native_rate)
                 mono = np.interp(
@@ -125,26 +164,52 @@ def _capture_thread():
                     mono,
                 ).astype(np.float32)
 
-            buf = np.concatenate([buf, mono])
+            resample_buf = np.concatenate([resample_buf, mono])
 
-            while len(buf) >= CHUNK_SAMPLES:
-                chunk_f32 = buf[:CHUNK_SAMPLES]
-                buf        = buf[CHUNK_SAMPLES:]
+            # Procesar en frames de FRAME_SAMPLES para VAD
+            while len(resample_buf) >= FRAME_SAMPLES:
+                vad_frame    = resample_buf[:FRAME_SAMPLES]
+                resample_buf = resample_buf[FRAME_SAMPLES:]
 
-                rms = _rms_f32(chunk_f32)
+                rms = _rms_f32(vad_frame)
                 _set_rms(rms)
 
-                if rms < RMS_THRESHOLD:
-                    continue  # silencio — descartar
+                is_voice = rms >= RMS_THRESHOLD
 
-                chunk_i16 = (chunk_f32 * 32767).clip(-32768, 32767).astype(np.int16)
-                chunk_bytes = chunk_i16.tobytes()
-                try:
-                    _audio_q.put_nowait(chunk_bytes)
-                    print(f'[Capture] chunk encolado — RMS={rms:.4f} len={len(chunk_bytes)} qsize={_audio_q.qsize()}')
-                except queue.Full:
-                    print(f'[Capture] COLA LLENA — chunk descartado, qsize={_audio_q.qsize()}')
+                if is_voice:
+                    # Frame de voz → acumular
+                    speech_buf     = np.concatenate([speech_buf, vad_frame])
+                    silence_frames = 0
+                    in_speech      = True
+
+                    # Seguridad: si el enunciado es demasiado largo, enviarlo de todos modos
+                    if len(speech_buf) >= MAX_SPEECH_SAMPLES:
+                        _enqueue_utterance(speech_buf, 'utterance[MAX]')
+                        speech_buf     = np.empty(0, dtype=np.float32)
+                        in_speech      = False
+                        silence_frames = 0
+
+                else:
+                    # Frame de silencio
+                    if in_speech:
+                        # Incluir el silencio en el buffer para contexto de Whisper
+                        speech_buf     = np.concatenate([speech_buf, vad_frame])
+                        silence_frames += 1
+
+                        if silence_frames >= SILENCE_FRAMES_END:
+                            # 1 s de silencio tras voz → fin de enunciado
+                            if len(speech_buf) >= MIN_SPEECH_SAMPLES:
+                                _enqueue_utterance(speech_buf, 'utterance[VAD]')
+                            else:
+                                print(f'[Capture] enunciado muy corto ({len(speech_buf)/TARGET_RATE:.2f}s) — descartado')
+                            speech_buf     = np.empty(0, dtype=np.float32)
+                            in_speech      = False
+                            silence_frames = 0
+                    # si no estábamos en voz, simplemente ignorar el frame de silencio
     finally:
+        # Enviar lo que quedaba acumulado si hay suficiente
+        if in_speech and len(speech_buf) >= MIN_SPEECH_SAMPLES:
+            _enqueue_utterance(speech_buf, 'utterance[FLUSH]')
         stream.stop_stream()
         stream.close()
         p.terminate()

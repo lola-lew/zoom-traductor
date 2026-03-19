@@ -180,23 +180,27 @@ class TranslatorPipeline:
             self._feed_pcm(data)
 
     def _feed_pcm(self, pcm_bytes: bytes) -> None:
-        """Acumula PCM int16 little-endian y encola chunks completos de 3 s."""
-        count   = len(pcm_bytes) // 2
-        samples = struct.unpack(f'<{count}h', pcm_bytes)
+        """
+        Procesa un enunciado completo de PCM int16 little-endian.
 
-        with self._lock:
-            self._buffer.extend(samples)
+        El cliente ya aplica VAD y envía cada enunciado como un chunk alineado
+        con pausas naturales del habla. No re-fragmentamos aquí: enviamos el
+        enunciado completo a Whisper para obtener transcripciones coherentes.
+        """
+        count = len(pcm_bytes) // 2
+        if count < int(SAMPLE_RATE * 0.3):
+            logger.debug('[Pipeline] chunk PCM muy corto (%d muestras) — descartado', count)
+            return
 
-            while len(self._buffer) >= CHUNK_SAMPLES:
-                chunk = self._buffer[:CHUNK_SAMPLES]
-                self._buffer = self._buffer[CHUNK_SAMPLES:]
-                rms_preview = _rms(chunk)
-                logger.info(
-                    '[Pipeline] chunk %.1f s encolado — RMS=%.0f umbral=%d buffer_restante=%d',
-                    CHUNK_SECONDS, rms_preview, SILENCE_THRESHOLD, len(self._buffer),
-                )
-                fut = self._executor.submit(self._process_chunk, list(chunk))
-                fut.add_done_callback(_log_future_error)
+        samples = list(struct.unpack(f'<{count}h', pcm_bytes))
+        rms_preview = _rms(samples)
+        dur_s = count / SAMPLE_RATE
+        logger.info(
+            '[Pipeline] utterance PCM recibida — %.2f s, RMS=%.0f, umbral=%d',
+            dur_s, rms_preview, SILENCE_THRESHOLD,
+        )
+        fut = self._executor.submit(self._process_chunk, samples)
+        fut.add_done_callback(_log_future_error)
 
     # ── Procesamiento por chunk (ThreadPoolExecutor) ──────────────────────
 
