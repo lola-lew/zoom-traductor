@@ -273,14 +273,15 @@ class TranslatorPipeline:
             logger.info('[Pipeline] TTS OK: %d bytes MP3 (b64 len=%d)',
                         len(audio_b64) * 3 // 4, len(audio_b64))
 
-            # Activar supresión post-TTS: estimamos duración del audio por largo del texto
-            # (~12 caracteres/segundo de habla) + 1 s de margen
-            suppress_secs = max(3.0, len(translated) / 12.0) + 1.0
-            self._suppress_until = time.time() + suppress_secs
-            logger.info('[Pipeline] supresión post-TTS: %.1f s (texto=%d chars)', suppress_secs, len(translated))
-
+            # Emitir primero, LUEGO activar supresión post-TTS.
+            # El TTS llega al navegador con ~200-500 ms de latencia + tiempo de reproducción.
+            # Margen de 2 s para cubrir latencia de red + buffering del browser.
             if self.on_translation:
                 self.on_translation(original, translated, audio_b64)
+
+            suppress_secs = max(3.0, len(translated) / 12.0) + 2.0
+            self._suppress_until = time.time() + suppress_secs
+            logger.info('[Pipeline] supresión post-TTS: %.1f s (texto=%d chars)', suppress_secs, len(translated))
 
         except Exception as exc:
             logger.error('[Pipeline] WORKER error: %s', exc, exc_info=True)
@@ -350,13 +351,18 @@ class TranslatorPipeline:
                 model='whisper-1',
                 file=('chunk.wav', wav_data, 'audio/wav'),
                 response_format='verbose_json',
+                # Prompt de contexto: reduce alucinaciones y orienta al modelo
+                # hacia conversación real en español (o el idioma fuente esperado)
+                prompt='Reunión de trabajo. Conversación en español.',
             )
             # no_speech_prob: promedio de segmentos (0.0 = voz clara, 1.0 = silencio)
             segs = getattr(t, 'segments', None) or []
             if segs:
                 avg_nsp = sum(getattr(s, 'no_speech_prob', 0) for s in segs) / len(segs)
             else:
-                avg_nsp = 0.0
+                # Sin segmentos: Whisper no pudo segmentar el audio.
+                # Usamos 0.5 como valor conservador — pasa el filtro solo si hay texto.
+                avg_nsp = 0.5 if not t.text.strip() else 0.0
             return t.text.strip(), (t.language or '').lower(), avg_nsp
         return _retry(_call, 'Whisper')
 

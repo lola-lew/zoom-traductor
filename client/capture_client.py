@@ -159,6 +159,18 @@ def _ws_thread(url: str):
     def on_open(ws):
         _set_status('Conectado — enviando audio', 'green')
 
+        # Vaciar cola de audio viejo capturado antes de conectar
+        # (evita burst de 40 chunks stale al entrar al meeting)
+        drained = 0
+        while not _audio_q.empty():
+            try:
+                _audio_q.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained:
+            print(f'[WS] cola vaciada al conectar — {drained} chunks descartados')
+
         _send_count = 0
         def _sender():
             nonlocal _send_count
