@@ -354,7 +354,7 @@ class TranslatorPipeline:
             # no_speech_prob: promedio de segmentos (0.0 = voz clara, 1.0 = silencio)
             segs = getattr(t, 'segments', None) or []
             if segs:
-                avg_nsp = sum(s.get('no_speech_prob', 0) for s in segs) / len(segs)
+                avg_nsp = sum(getattr(s, 'no_speech_prob', 0) for s in segs) / len(segs)
             else:
                 avg_nsp = 0.0
             return t.text.strip(), (t.language or '').lower(), avg_nsp
