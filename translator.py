@@ -141,6 +141,10 @@ class TranslatorPipeline:
         self._last_transcriptions: list[str] = []   # últimas N transcripciones
         self._dedup_lock = threading.Lock()
 
+        # Supresión post-TTS: ignora chunks mientras el TTS está sonando por los parlantes
+        # Evita el feedback loop loopback → Whisper → GPT → TTS → loopback
+        self._suppress_until: float = 0.0
+
         # Callbacks
         self.on_translation: Optional[Callable[[str, str, str], None]] = None
         self.on_error:       Optional[Callable[[str], None]]            = None
@@ -152,6 +156,7 @@ class TranslatorPipeline:
         with self._lock:
             self._buffer = []
         self._silent_samples_acc = 0
+        self._suppress_until = 0.0
         with self._dedup_lock:
             self._last_transcriptions = []
         self._running = True
@@ -202,6 +207,13 @@ class TranslatorPipeline:
                     rms, len(samples), SILENCE_THRESHOLD)
 
         try:
+            # ── Supresión post-TTS (feedback loop loopback → TTS → loopback) ──
+            remaining = self._suppress_until - time.time()
+            if remaining > 0:
+                logger.info('[Pipeline] chunk ignorado — supresión post-TTS activa (%.1f s restantes)',
+                            remaining)
+                return
+
             # ── Detección de silencio ─────────────────────────────────────
             if rms < SILENCE_THRESHOLD:
                 self._silent_samples_acc += len(samples)
@@ -226,7 +238,7 @@ class TranslatorPipeline:
                 return
 
             # Filtro no_speech_prob: Whisper indica que probablemente no hay voz
-            if no_speech_prob > 0.6:
+            if no_speech_prob > 0.5:
                 logger.info('[Pipeline] chunk descartado — no_speech_prob=%.2f (probable silencio/ruido)',
                             no_speech_prob)
                 return
@@ -235,11 +247,12 @@ class TranslatorPipeline:
                 logger.info('[Pipeline] alucinación descartada: %r', original)
                 return
 
-            # Filtro anti-loop: si Whisper detecta el idioma destino, es audio del TTS
-            # que volvió por el loopback. También filtramos español/portugués por similitud.
-            _LOOP_LANGS = {self.target_lang, 'pt', 'es'} if self.target_lang in ('pt', 'es') else {self.target_lang}
-            if detected_lang in _LOOP_LANGS:
-                logger.info('[Pipeline] chunk descartado — idioma detectado=%r posible loop TTS (target=%r)',
+            # Filtro anti-loop: si Whisper detecta exactamente el idioma destino,
+            # probablemente es el audio del TTS que volvió por el loopback.
+            # IMPORTANTE: solo filtramos el idioma destino exacto — no el idioma fuente
+            # del coordinador (ej: si target=pt y coordinador habla es, NO filtrar es).
+            if detected_lang == self.target_lang:
+                logger.info('[Pipeline] chunk descartado — idioma detectado=%r = target=%r, posible loop TTS',
                             detected_lang, self.target_lang)
                 return
 
@@ -259,6 +272,12 @@ class TranslatorPipeline:
             audio_b64  = self._tts(translated)
             logger.info('[Pipeline] TTS OK: %d bytes MP3 (b64 len=%d)',
                         len(audio_b64) * 3 // 4, len(audio_b64))
+
+            # Activar supresión post-TTS: estimamos duración del audio por largo del texto
+            # (~12 caracteres/segundo de habla) + 1 s de margen
+            suppress_secs = max(3.0, len(translated) / 12.0) + 1.0
+            self._suppress_until = time.time() + suppress_secs
+            logger.info('[Pipeline] supresión post-TTS: %.1f s (texto=%d chars)', suppress_secs, len(translated))
 
             if self.on_translation:
                 self.on_translation(original, translated, audio_b64)
