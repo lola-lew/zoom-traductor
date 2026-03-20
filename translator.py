@@ -69,9 +69,12 @@ def _is_hallucination(text: str) -> bool:
 _WEBM_SILENCE_RMS = 200
 
 # Detección de silencio
-# RMS int16: silencio puro ≈ 0, ruido de fondo ≈ 100-400, voz normal ≈ 500+
-# Umbral subido a 400 para evitar alucinaciones de Whisper con audio muy bajo.
-SILENCE_THRESHOLD = 400
+# RMS int16: silencio puro ≈ 0, ruido de fondo ≈ 100-150, voz normal ≈ 400+
+# Umbral bajado a 150: el VAD del cliente ya garantiza que el chunk contiene voz
+# (solo envía si detectó RMS >= 0.015 float32 ≈ 492 int16). El padding de silencio
+# de 300ms×2 + ~1s de silencio de cierre del VAD diluyen el RMS global del utterance
+# — un habla real de RMS~500 llega al servidor como ~350. Con 400 se bloqueaban todos.
+SILENCE_THRESHOLD = 150
 SILENCE_LOG_S     = 30   # loguear (pero no enviar) si hay silencio continuo
 
 # Reintentos en errores transitorios de OpenAI
