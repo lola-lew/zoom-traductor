@@ -35,7 +35,10 @@ RECONNECT_DELAY = 3              # segundos entre reintentos WS
 # VAD — detección de pausas naturales del habla
 FRAME_MS           = 30                                      # duración de cada frame
 FRAME_SAMPLES      = int(TARGET_RATE * FRAME_MS / 1000)      # 480 muestras @ 16 kHz
-SILENCE_FRAMES_END = int(1.0 / (FRAME_MS / 1000))            # 33 frames ≈ 1 s de silencio → enviar
+SILENCE_FRAMES_END = int(0.7 / (FRAME_MS / 1000))            # 23 frames ≈ 700 ms de silencio → enviar
+                                                             # Reducido de 1 s: menos latencia percibida entre
+                                                             # frases. 700 ms es suficiente para separar
+                                                             # enunciados sin cortar pausas internas del habla.
 MIN_SPEECH_SAMPLES = int(TARGET_RATE * 0.5)                  # mínimo 0.5 s de voz para enviar
 MAX_SPEECH_SAMPLES = int(TARGET_RATE * 12)                   # máximo 12 s → enviar aunque no haya pausa
 PADDING_SAMPLES    = int(TARGET_RATE * 0.3)                  # 300 ms de silencio al inicio/fin del enunciado
