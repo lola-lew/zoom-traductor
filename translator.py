@@ -8,6 +8,7 @@ Mejoras respecto a versión anterior:
 """
 
 import base64
+import difflib
 import io
 import logging
 import struct
@@ -30,8 +31,6 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
-CHUNK_SECONDS  = 3
-CHUNK_SAMPLES  = SAMPLE_RATE * CHUNK_SECONDS   # 48 000 muestras
 
 # Magic bytes del init segment webm/EBML — identifica chunks de MediaRecorder (Linux)
 _WEBM_MAGIC = b'\x1a\x45\xdf\xa3'
@@ -127,13 +126,11 @@ _TRANSIENT_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError)
 
 
 class TranslatorPipeline:
-    """Acumula PCM int16, procesa chunks y dispara callbacks con el resultado."""
+    """Recibe utterances PCM completos (VAD del cliente), traduce y emite audio."""
 
     def __init__(self):
         self._client   = OpenAI()
         self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix='translator')
-        self._buffer: list[int] = []
-        self._lock     = threading.Lock()
         self._running  = False
         self.target_lang = 'pt'
 
@@ -162,8 +159,6 @@ class TranslatorPipeline:
 
     def start(self, target_lang: str = 'pt') -> None:
         self.target_lang = target_lang
-        with self._lock:
-            self._buffer = []
         self._silent_samples_acc = 0
         self._suppress_until = 0.0
         with self._dedup_lock:
@@ -270,12 +265,17 @@ class TranslatorPipeline:
                             detected_lang, self.target_lang)
                 return
 
-            # Deduplicación: descartar si es igual a alguna de las últimas 3 transcripciones
+            # Deduplicación fuzzy: descarta si el texto es >= 85% similar a alguna
+            # de las últimas 3 transcripciones. Captura variantes por puntuación o
+            # una palabra diferente ("Buenos días a todos" vs "Buenos días a todos.").
             normalized = _PUNCT_RE.sub('', original.lower()).strip()
             with self._dedup_lock:
-                if normalized in self._last_transcriptions:
-                    logger.info('[Pipeline] chunk descartado — duplicado reciente: %r', original)
-                    return
+                for prev in self._last_transcriptions:
+                    similarity = difflib.SequenceMatcher(None, normalized, prev).ratio()
+                    if similarity >= 0.85:
+                        logger.info('[Pipeline] chunk descartado — duplicado reciente (sim=%.2f): %r',
+                                    similarity, original)
+                        return
                 self._last_transcriptions.append(normalized)
                 if len(self._last_transcriptions) > 3:
                     self._last_transcriptions.pop(0)
@@ -295,7 +295,7 @@ class TranslatorPipeline:
             if self.on_translation:
                 self.on_translation(original, translated, audio_b64)
 
-            suppress_secs = max(3.0, len(translated) / 12.0) + 2.0
+            suppress_secs = max(3.0, len(translated) / 10.0) + 2.0  # 10 chars/s (conservador para TTS pt-BR)
             self._suppress_until = time.time() + suppress_secs
             logger.info('[Pipeline] supresión post-TTS: %.1f s (texto=%d chars)', suppress_secs, len(translated))
 
