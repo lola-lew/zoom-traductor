@@ -1,5 +1,5 @@
 """
-Pipeline: PCM audio → Whisper → GPT-4o-mini → TTS nova
+Pipeline: PCM audio → Whisper → GPT-4o-mini → TTS nova (OpenAI)
 
 Mejoras respecto a versión anterior:
  - Detección de silencio: chunks con RMS < umbral no se envían a Whisper
@@ -469,6 +469,7 @@ class TranslatorPipeline:
         return _retry(_call, 'GPT')
 
     def _tts(self, text: str) -> str:
+        """Genera audio MP3 en base64 via OpenAI TTS nova."""
         def _call():
             tts = self._client.audio.speech.create(
                 model='tts-1',
