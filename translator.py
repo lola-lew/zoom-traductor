@@ -8,9 +8,11 @@ Mejoras respecto a versión anterior:
 """
 
 import base64
+import collections
 import difflib
 import io
 import logging
+import platform as _platform
 import struct
 import threading
 import time
@@ -143,14 +145,15 @@ class TranslatorPipeline:
 
         # Supresión post-TTS: bloquea procesamiento mientras el TTS está sonando.
         # Evita el feedback loop loopback → Whisper → GPT → TTS → loopback.
+        # En Linux/Railway el feedback es imposible (WebRTC stream solo capta la reunión),
+        # por lo que el margen es mínimo — solo el tiempo real del audio TTS.
         self._suppress_until: float = 0.0
 
-        # Buffer de utterance pendiente: si llega audio durante la supresión post-TTS,
-        # en vez de descartarlo lo guardamos. Cuando expira la supresión, lo procesamos.
-        # Así el coordinador puede seguir hablando mientras suena el TTS y no se pierde
-        # la frase siguiente. Solo guardamos el MÁS RECIENTE (el anterior ya es stale).
-        self._pending_samples: Optional[list] = None
-        self._pending_lock    = threading.Lock()
+        # Cola de utterances pendientes: si llegan frases durante la supresión post-TTS,
+        # se encolan (máx 4) en vez de descartarlas. Cuando expira la supresión se
+        # procesan en orden FIFO para no perder ninguna frase intermedia.
+        self._pending_queue: collections.deque = collections.deque(maxlen=4)
+        self._pending_lock  = threading.Lock()
 
         # Prompt rodante para Whisper: se actualiza con las últimas ~30 palabras
         # transcritas para que Whisper mantenga coherencia entre enunciados.
@@ -169,7 +172,7 @@ class TranslatorPipeline:
         self._silent_samples_acc = 0
         self._suppress_until = 0.0
         with self._pending_lock:
-            self._pending_samples = None
+            self._pending_queue.clear()
         with self._dedup_lock:
             self._last_transcriptions = []
         self._running = True
@@ -232,13 +235,14 @@ class TranslatorPipeline:
             # ── Supresión post-TTS (feedback loop loopback → TTS → loopback) ──
             remaining = self._suppress_until - time.time()
             if remaining > 0:
-                # En vez de descartar, guardar el utterance más reciente.
-                # Cuando expire la supresión, _schedule_pending_drain lo procesará.
-                # Así no se pierde la frase que el coordinador dice mientras suena el TTS.
+                # Encolar el utterance en vez de descartarlo (máx 4 en cola).
+                # Cuando expire la supresión, _schedule_pending_drain los procesa
+                # en orden FIFO para no perder frases intermedias.
                 with self._pending_lock:
-                    self._pending_samples = samples
-                logger.info('[Pipeline] utterance bufferizado durante supresión post-TTS '
-                            '(%.1f s restantes, %d muestras guardadas)', remaining, len(samples))
+                    self._pending_queue.append(samples)
+                    qsize = len(self._pending_queue)
+                logger.info('[Pipeline] utterance encolado durante supresión post-TTS '
+                            '(%.1f s restantes, cola=%d, %d muestras)', remaining, qsize, len(samples))
                 return
 
             # ── Detección de silencio ─────────────────────────────────────
@@ -313,9 +317,21 @@ class TranslatorPipeline:
             if self.on_translation:
                 self.on_translation(original, translated, audio_b64)
 
-            suppress_secs = max(3.0, len(translated) / 10.0) + 2.0  # 10 chars/s (conservador para TTS pt-BR)
+            # Calcular supresión a partir de la duración real del audio TTS.
+            # MP3 a ~128 kbps → 16 000 bytes/s.
+            tts_bytes    = len(audio_b64) * 3 // 4   # base64 → bytes reales
+            tts_duration = tts_bytes / 16_000.0       # segundos de audio
+            # Margen por plataforma:
+            #   Windows: VB-Cable captura speakers → margen amplio para evitar loopback
+            #   Linux (Railway): bot escucha solo el WebRTC de Zoom, feedback imposible
+            if _platform.system() == 'Windows':
+                margin = 2.0
+            else:
+                margin = 0.4   # solo latencia de red/buffer del browser
+            suppress_secs = tts_duration + margin
             self._suppress_until = time.time() + suppress_secs
-            logger.info('[Pipeline] supresión post-TTS: %.1f s (texto=%d chars)', suppress_secs, len(translated))
+            logger.info('[Pipeline] supresión post-TTS: %.1f s (tts=%.2f s + margen=%.1f s)',
+                        suppress_secs, tts_duration, margin)
             # Programar procesamiento del utterance pendiente al expirar la supresión.
             # Si el coordinador habló durante la supresión, lo procesamos ahora.
             self._schedule_pending_drain(suppress_secs)
@@ -326,21 +342,24 @@ class TranslatorPipeline:
                 self.on_error(str(exc))
 
     def _schedule_pending_drain(self, delay: float) -> None:
-        """Lanza un hilo que, tras `delay` segundos, procesa el utterance bufferizado.
+        """Lanza un hilo que, tras `delay` segundos, drena la cola de utterances pendientes.
 
-        Cuando el coordinador habla mientras suena el TTS, el utterance queda en
-        self._pending_samples. Este método lo procesa justo cuando expira la supresión,
-        de forma que no se pierde ninguna frase aunque llegue durante la ventana bloqueada.
+        Las frases que llegaron durante la supresión post-TTS quedan encoladas en
+        self._pending_queue (FIFO, máx 4). Este método las procesa en orden cuando
+        expira la supresión, con 200 ms entre cada una para no solapar workers.
         """
         def _drain():
             time.sleep(delay + 0.2)   # pequeño margen tras el fin de la supresión
-            with self._pending_lock:
-                pending = self._pending_samples
-                self._pending_samples = None
-            if pending and self._running:
-                logger.info('[Pipeline] procesando utterance bufferizado post-supresión (%d muestras)', len(pending))
+            while self._running:
+                with self._pending_lock:
+                    if self._pending_queue:
+                        pending = self._pending_queue.popleft()
+                    else:
+                        break
+                logger.info('[Pipeline] procesando utterance de cola post-supresión (%d muestras)', len(pending))
                 fut = self._executor.submit(self._process_chunk, pending)
                 fut.add_done_callback(_log_future_error)
+                time.sleep(0.2)   # pequeña pausa entre utterances encolados
 
         threading.Thread(target=_drain, daemon=True, name='pending-drain').start()
 
