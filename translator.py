@@ -145,6 +145,12 @@ class TranslatorPipeline:
         # Evita el feedback loop loopback → Whisper → GPT → TTS → loopback
         self._suppress_until: float = 0.0
 
+        # Prompt rodante para Whisper: se actualiza con las últimas ~30 palabras
+        # transcritas para que Whisper mantenga coherencia entre enunciados.
+        # Técnica clave de whisper_streaming — Whisper acepta hasta 224 tokens de contexto.
+        self._whisper_prompt: str = 'Reunión de trabajo. Conversación en español.'
+        self._prompt_lock = threading.Lock()
+
         # Callbacks
         self.on_translation: Optional[Callable[[str, str, str], None]] = None
         self.on_error:       Optional[Callable[[str], None]]            = None
@@ -160,6 +166,7 @@ class TranslatorPipeline:
         with self._dedup_lock:
             self._last_transcriptions = []
         self._running = True
+        self._whisper_prompt = 'Reunión de trabajo. Conversación en español.'
         logger.info('TranslatorPipeline iniciado (lang=%s)', target_lang)
 
     def stop(self) -> None:
@@ -271,6 +278,8 @@ class TranslatorPipeline:
                     self._last_transcriptions.pop(0)
 
             logger.info('[Pipeline] Whisper OK: %r (lang=%s, no_speech=%.2f)', original, detected_lang, no_speech_prob)
+            # Actualizar prompt rodante con esta transcripción para el siguiente enunciado
+            self._update_whisper_prompt(original)
             translated = self._translate(original)
             logger.info('[Pipeline] GPT OK: %r', translated)
             audio_b64  = self._tts(translated)
@@ -350,25 +359,38 @@ class TranslatorPipeline:
 
     def _transcribe(self, wav_data: bytes) -> tuple[str, str, float]:
         """Devuelve (text, language, no_speech_prob). no_speech_prob: 0.0=voz, 1.0=silencio."""
+        with self._prompt_lock:
+            current_prompt = self._whisper_prompt
+
         def _call():
             t = self._client.audio.transcriptions.create(
                 model='whisper-1',
                 file=('chunk.wav', wav_data, 'audio/wav'),
                 response_format='verbose_json',
-                # Prompt de contexto: reduce alucinaciones y orienta al modelo
-                # hacia conversación real en español (o el idioma fuente esperado)
-                prompt='Reunión de trabajo. Conversación en español.',
+                # Prompt rodante: incluye las últimas palabras transcritas como contexto.
+                # Whisper usa hasta 224 tokens previos para mantener coherencia entre
+                # enunciados (nombres propios, jerga, continuidad de puntuación).
+                prompt=current_prompt,
             )
             # no_speech_prob: promedio de segmentos (0.0 = voz clara, 1.0 = silencio)
             segs = getattr(t, 'segments', None) or []
             if segs:
                 avg_nsp = sum(getattr(s, 'no_speech_prob', 0) for s in segs) / len(segs)
             else:
-                # Sin segmentos: Whisper no pudo segmentar el audio.
-                # Usamos 0.5 como valor conservador — pasa el filtro solo si hay texto.
                 avg_nsp = 0.5 if not t.text.strip() else 0.0
             return t.text.strip(), (t.language or '').lower(), avg_nsp
         return _retry(_call, 'Whisper')
+
+    def _update_whisper_prompt(self, transcript: str) -> None:
+        """Actualiza el prompt rodante con las últimas ~30 palabras de la transcripción.
+        Mantiene el encabezado fijo y concatena las últimas palabras como contexto.
+        Whisper solo considera los últimos 224 tokens — 30 palabras ≈ 40 tokens, seguro."""
+        words = transcript.split()
+        context = ' '.join(words[-30:]) if len(words) > 30 else transcript
+        new_prompt = f'Reunión de trabajo. {context}'
+        with self._prompt_lock:
+            self._whisper_prompt = new_prompt
+        logger.debug('[Pipeline] prompt Whisper actualizado: %r', new_prompt[-60:])
 
     def _translate(self, text: str) -> str:
         lang = LANGUAGES.get(self.target_lang, LANGUAGES['pt'])

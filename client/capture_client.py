@@ -38,6 +38,9 @@ FRAME_SAMPLES      = int(TARGET_RATE * FRAME_MS / 1000)      # 480 muestras @ 16
 SILENCE_FRAMES_END = int(1.0 / (FRAME_MS / 1000))            # 33 frames ≈ 1 s de silencio → enviar
 MIN_SPEECH_SAMPLES = int(TARGET_RATE * 0.5)                  # mínimo 0.5 s de voz para enviar
 MAX_SPEECH_SAMPLES = int(TARGET_RATE * 12)                   # máximo 12 s → enviar aunque no haya pausa
+PADDING_SAMPLES    = int(TARGET_RATE * 0.3)                  # 300 ms de silencio al inicio/fin del enunciado
+                                                             # Whisper pierde fonemas cuando el audio empieza
+                                                             # o termina de forma abrupta sin contexto previo
 
 # ── Estado compartido ─────────────────────────────────────────────────────────
 
@@ -95,14 +98,23 @@ def _find_loopback_device(p: pyaudio.PyAudio):
 # ── Hilo de captura de audio ──────────────────────────────────────────────────
 
 def _enqueue_utterance(speech_buf: np.ndarray, label: str) -> None:
-    """Convierte un array float32 de un enunciado completo a PCM int16 y lo encola."""
+    """Convierte un array float32 de un enunciado completo a PCM int16 y lo encola.
+
+    Agrega 300 ms de silencio al inicio y fin del enunciado. Whisper pierde los
+    primeros y últimos fonemas cuando el audio empieza/termina de forma abrupta —
+    el padding le da el contexto acústico necesario para una transcripción completa.
+    """
     rms = _rms_f32(speech_buf)
-    chunk_i16   = (speech_buf * 32767).clip(-32768, 32767).astype(np.int16)
+    padding = np.zeros(PADDING_SAMPLES, dtype=np.float32)
+    padded_buf = np.concatenate([padding, speech_buf, padding])
+    chunk_i16   = (padded_buf * 32767).clip(-32768, 32767).astype(np.int16)
     chunk_bytes = chunk_i16.tobytes()
     try:
         _audio_q.put_nowait(chunk_bytes)
-        print(f'[Capture] {label} — RMS={rms:.4f} dur={len(speech_buf)/TARGET_RATE:.2f}s '
-              f'len={len(chunk_bytes)} qsize={_audio_q.qsize()}')
+        dur_speech = len(speech_buf) / TARGET_RATE
+        dur_total  = len(padded_buf) / TARGET_RATE
+        print(f'[Capture] {label} — RMS={rms:.4f} voz={dur_speech:.2f}s total={dur_total:.2f}s '
+              f'(+{PADDING_SAMPLES*2/TARGET_RATE:.1f}s padding) qsize={_audio_q.qsize()}')
     except queue.Full:
         print(f'[Capture] COLA LLENA — {label} descartado, qsize={_audio_q.qsize()}')
 
