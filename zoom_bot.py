@@ -89,15 +89,29 @@ _STEALTH_SCRIPT = r"""
 
 # ── Script de captura de audio via Web Audio API (Linux/Railway) ─────────────
 # Inyectado como init_script ANTES de que Zoom inicialice (solo en Linux).
-# Parchea RTCPeerConnection para interceptar tracks de audio remotos.
-# ScriptProcessorNode convierte float32 → int16 PCM a 16 kHz y envía
-# chunks binarios via WebSocket al pipeline interno de Whisper.
+# Intercepta RTCPeerConnection → obtiene el audio track de los participantes →
+# AudioContext (16 kHz) + ScriptProcessorNode → VAD por energía idéntico al
+# capture_client.py → envía utterances completos como PCM int16 via WebSocket.
+#
+# Al usar PCM int16 (no webm), el servidor reutiliza _feed_pcm() con el mismo
+# pipeline VAD → Whisper → GPT → TTS que ya funciona. Sin duplicar lógica.
 _CAPTURE_SCRIPT = r"""
 (wsUrl) => {
 
-  let ws       = null;
-  let wsReady  = false;
-  const pending = [];   // buffer de chunks hasta que WS esté listo
+  // ── Constantes VAD (espejo de capture_client.py) ──────────────────────
+  const TARGET_RATE        = 16000;
+  const FRAME_MS           = 30;
+  const FRAME_SAMPLES      = Math.floor(TARGET_RATE * FRAME_MS / 1000); // 480
+  const SILENCE_FRAMES_END = Math.floor(0.7  / (FRAME_MS / 1000));      // 23 ≈ 700 ms
+  const MIN_SPEECH_SAMPLES = Math.floor(TARGET_RATE * 0.5);             // 8 000
+  const MAX_SPEECH_SAMPLES = Math.floor(TARGET_RATE * 12);              // 192 000
+  const PADDING_SAMPLES    = Math.floor(TARGET_RATE * 0.3);             // 4 800 (300 ms)
+  const RMS_THRESHOLD      = 0.015;
+
+  // ── WebSocket ─────────────────────────────────────────────────────────
+  let ws      = null;
+  let wsReady = false;
+  const pending = [];
 
   function connectWS() {
     ws = new WebSocket(wsUrl);
@@ -108,7 +122,7 @@ _CAPTURE_SCRIPT = r"""
       while (pending.length) ws.send(pending.shift());
     };
     ws.onclose = () => {
-      wsReady = false;
+      wsReady  = false;
       console.warn('[Capture] WS cerrado — reconectando en 2 s');
       setTimeout(connectWS, 2000);
     };
@@ -116,93 +130,145 @@ _CAPTURE_SCRIPT = r"""
   }
   connectWS();
 
-  const connectedTracks = new Set();
-  let firstChunkSent = false;
-  let pendingTrack   = null;   // track detectado, esperando __startCapture()
-  let captureArmed   = false;  // true tras llamar __startCapture()
-  let captureStarted = false;  // true una vez que el MediaRecorder arranca
+  // ── Envío de utterance ────────────────────────────────────────────────
+  function sendUtterance(speechArr, label) {
+    // Añadir 300 ms de silencio al inicio y fin (mismo padding que capture_client.py)
+    const pad    = new Float32Array(PADDING_SAMPLES); // ceros
+    const total  = new Float32Array(PADDING_SAMPLES + speechArr.length + PADDING_SAMPLES);
+    total.set(pad, 0);
+    total.set(speechArr, PADDING_SAMPLES);
+    total.set(pad, PADDING_SAMPLES + speechArr.length);
 
-  function startRecorder(track) {
-    const stream = new MediaStream([track]);
-    console.log('[Capture] MediaStream creado — audioTracks:', stream.getAudioTracks().length,
-                '| active:', stream.active);
-
-    const mimeType = 'audio/webm;codecs=opus';
-    if (!MediaRecorder.isTypeSupported(mimeType)) {
-      console.warn('[Capture] mimeType no soportado:', mimeType, '— usando default');
+    // Convertir float32 → int16 little-endian
+    const i16 = new Int16Array(total.length);
+    for (let i = 0; i < total.length; i++) {
+      i16[i] = Math.max(-32768, Math.min(32767, Math.round(total[i] * 32767)));
     }
 
-    // El primer ondataavailable contiene el init segment (cabecera webm).
-    // Se envía una sola vez; los chunks siguientes se envían tal como llegan.
-    let initSent = false;
+    const dur = speechArr.length / TARGET_RATE;
+    console.log('[Capture]', label, '— voz=', dur.toFixed(2) + 's',
+                'bytes=', i16.buffer.byteLength);
+    if (ws && ws.readyState === 1) {
+      ws.send(i16.buffer);
+    } else if (pending.length < 10) {
+      pending.push(i16.buffer);
+    }
+  }
 
-    const recorder = new MediaRecorder(stream, { mimeType });
+  // ── VAD (Voice Activity Detection) ───────────────────────────────────
+  let speechBuf    = [];   // samples float32 acumulados
+  let inSpeech     = false;
+  let silenceFrames = 0;
+  let frameBuf     = new Float32Array(0);  // buffer de resampleo
 
-    recorder.ondataavailable = async (e) => {
-      if (e.data.size === 0) return;
-      const buf = await e.data.arrayBuffer();
-      if (!initSent) {
-        initSent = true;
-        console.log('[Capture] init chunk recibido — bytes:', buf.byteLength);
+  function processVADFrame(frame) {
+    // RMS del frame
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    const rms     = Math.sqrt(sum / frame.length);
+    const isVoice = rms >= RMS_THRESHOLD;
+
+    if (isVoice) {
+      for (let i = 0; i < frame.length; i++) speechBuf.push(frame[i]);
+      silenceFrames = 0;
+      inSpeech      = true;
+      if (speechBuf.length >= MAX_SPEECH_SAMPLES) {
+        sendUtterance(new Float32Array(speechBuf), 'utterance[MAX]');
+        speechBuf     = [];
+        inSpeech      = false;
+        silenceFrames = 0;
       }
-      if (wsReady && ws.readyState === 1) {
-        ws.send(buf);
-        if (!firstChunkSent) {
-          firstChunkSent = true;
-          console.log('[Capture] primer chunk enviado — bytes:', buf.byteLength);
+    } else {
+      if (inSpeech) {
+        for (let i = 0; i < frame.length; i++) speechBuf.push(frame[i]);
+        silenceFrames++;
+        if (silenceFrames >= SILENCE_FRAMES_END) {
+          if (speechBuf.length >= MIN_SPEECH_SAMPLES) {
+            sendUtterance(new Float32Array(speechBuf), 'utterance[VAD]');
+          } else {
+            console.log('[Capture] utterance muy corto —', (speechBuf.length/TARGET_RATE).toFixed(2) + 's descartado');
+          }
+          speechBuf     = [];
+          inSpeech      = false;
+          silenceFrames = 0;
         }
-      } else if (pending.length < 20) {
-        pending.push(buf);
+      }
+    }
+  }
+
+  // ── Captura del track WebRTC via AudioContext ─────────────────────────
+  function startCapture(track) {
+    const stream   = new MediaStream([track]);
+    // AudioContext a TARGET_RATE — Chrome lo soporta y resamplea internamente
+    const audioCtx = new AudioContext({ sampleRate: TARGET_RATE });
+    const source   = audioCtx.createMediaStreamSource(stream);
+    // ScriptProcessorNode: buffer 4096 para estabilidad, VAD interno procesa en FRAME_SAMPLES
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      // Acumular en frameBuf y procesar en chunks de FRAME_SAMPLES
+      const merged = new Float32Array(frameBuf.length + input.length);
+      merged.set(frameBuf);
+      merged.set(input, frameBuf.length);
+      frameBuf = merged;
+      while (frameBuf.length >= FRAME_SAMPLES) {
+        processVADFrame(frameBuf.slice(0, FRAME_SAMPLES));
+        frameBuf = frameBuf.slice(FRAME_SAMPLES);
       }
     };
 
-    recorder.onstart = () => console.log('[Capture] MediaRecorder started — mimeType:', recorder.mimeType);
-    recorder.onerror = (e) => console.error('[Capture] MediaRecorder error:', e.error?.message);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);  // necesario para que el grafo procese
 
-    recorder.start(3000);  // chunk cada 3 s
+    // audioCtx puede iniciarse en estado 'suspended' en Chrome headless sin
+    // interacción de usuario. resume() lo activa explícitamente.
+    audioCtx.resume().catch(e => console.warn('[Capture] audioCtx.resume() error:', e));
+    console.log('[Capture] AudioContext+VAD iniciado — sampleRate:', audioCtx.sampleRate,
+                'state:', audioCtx.state);
   }
+
+  // ── Intercepción de RTCPeerConnection ────────────────────────────────
+  const connectedTracks = new Set();
+  let pendingTrack  = null;
+  let captureArmed  = false;
+  let captureStarted = false;
 
   function attachTrack(track) {
     if (connectedTracks.has(track.id)) return;
     connectedTracks.add(track.id);
-    console.log('[Capture] attachTrack — kind:', track.kind, '| id:', track.id,
-                '| readyState:', track.readyState, '| armed:', captureArmed);
+    console.log('[Capture] track detectado — kind:', track.kind, 'id:', track.id,
+                'armed:', captureArmed);
     pendingTrack = track;
-    // Si __startCapture() ya fue llamado, arrancar inmediatamente
     if (captureArmed && !captureStarted) {
       captureStarted = true;
-      startRecorder(track);
+      startCapture(track);
     }
   }
 
-  // Python llama __startCapture() desde _capture_audio_playwright() cuando
-  // el bot está confirmado IN_MEETING — evita capturar audio del join flow.
   window.__startCapture = () => {
     if (captureArmed) return 'already_armed';
     captureArmed = true;
     console.log('[Capture] __startCapture() — pendingTrack:', !!pendingTrack);
     if (pendingTrack && !captureStarted) {
       captureStarted = true;
-      startRecorder(pendingTrack);
+      startCapture(pendingTrack);
       return 'started';
     }
     return 'armed_waiting_track';
   };
 
-  // Interceptar RTCPeerConnection de Zoom para capturar tracks entrantes
   const _OrigPC = window.RTCPeerConnection;
   window.RTCPeerConnection = function(...args) {
     const pc = new _OrigPC(...args);
-    console.log('[Capture] nuevo PC creado — total interceptados:', window.__capturePC = (window.__capturePC || 0) + 1);
     pc.addEventListener('track', (event) => {
-      console.log('[Capture] track detectado en PC:', event.track.kind);
       if (event.track.kind === 'audio') attachTrack(event.track);
     });
     return pc;
   };
   Object.assign(window.RTCPeerConnection, _OrigPC);
 
-  console.log('[Capture] script iniciado — wsUrl:', wsUrl);
+  console.log('[Capture] script VAD iniciado — wsUrl:', wsUrl);
 }
 """
 
@@ -340,10 +406,15 @@ class ZoomBot:
 
         await self._context.add_init_script(f'({_STEALTH_SCRIPT})()')
 
-        # En Linux (Railway): el audio llega del browser del coordinador via SocketIO.
-        # _CAPTURE_SCRIPT ya no es necesario — el bot solo entra a la reunión y escucha.
+        # En Linux (Railway): inyectar _CAPTURE_SCRIPT como init_script para que
+        # intercepte RTCPeerConnection ANTES de que Zoom lo inicialice.
+        # El script captura los tracks de audio de los participantes via WebRTC
+        # y los envía como webm/opus al WebSocket interno del servidor.
         if _platform.system() != 'Windows':
-            logger.info('[ZoomBot] Linux detectado — audio via coordinador (sin _CAPTURE_SCRIPT)')
+            logger.info('[ZoomBot] Linux detectado — inyectando _CAPTURE_SCRIPT para captura WebRTC')
+            await self._context.add_init_script(
+                f'({_CAPTURE_SCRIPT})({repr(self.audio_ws_url)})'
+            )
 
         self._page = await self._context.new_page()
 
@@ -931,9 +1002,9 @@ class ZoomBot:
             self._monitoring = True
             asyncio.create_task(self._capture_audio())
         else:
-            self._set_state(IN_MEETING, 'Dentro de la reunión — audio via coordinador')
+            self._set_state(IN_MEETING, 'Dentro de la reunión — audio via WebRTC (servidor)')
             self._monitoring = True
-            # Audio llega del browser del coordinador via SocketIO — sin captura local
+            asyncio.create_task(self._capture_audio_playwright())
         asyncio.create_task(self._monitor_meeting())
         asyncio.create_task(self._heartbeat())
 
@@ -1061,10 +1132,13 @@ class ZoomBot:
             logger.info('[Capture] detenido — %d frames enviados', frame_count)
 
     async def _capture_audio_playwright(self) -> None:
-        """Linux: llama __startCapture() en la página de Zoom para iniciar MediaRecorder.
+        """Linux/Railway: arma el VAD AudioContext en la página Zoom vía __startCapture().
 
-        El MediaRecorder solo arranca aquí, después de que el bot está confirmado
-        IN_MEETING, evitando capturar audio del join flow o de la sala de espera.
+        __startCapture() activa el _CAPTURE_SCRIPT inyectado como init_script.
+        El script intercepta el RTCPeerConnection, toma el track de audio entrante,
+        aplica VAD (idéntico a capture_client.py) y envía utterances PCM int16 al
+        WebSocket interno (port 8765). Solo se arma aquí, una vez confirmado IN_MEETING,
+        para no capturar audio del join flow ni de la sala de espera.
         """
         logger.info('[Capture] IN_MEETING confirmado — llamando __startCapture() en la página')
         try:

@@ -183,11 +183,15 @@ class TranslatorPipeline:
     # ── Feed de audio (llamado desde el WebSocket interno) ────────────────
 
     def feed_audio(self, data: bytes) -> None:
-        """Recibe bytes de audio — PCM int16 (Windows) o webm/opus (Linux vía MediaRecorder)."""
+        """Recibe bytes de audio — PCM int16 (ambos sistemas vía _CAPTURE_SCRIPT / capture_client.py).
+
+        La ruta webm se mantiene como fallback legacy por si alguna integración
+        antigua envía webm/opus (MediaRecorder). La ruta normal es PCM int16.
+        """
         if not self._running:
             return
         if data[:4] == _WEBM_MAGIC:
-            # Ruta Linux: webm/opus de MediaRecorder → directo a Whisper sin buffer
+            # Fallback legacy: webm/opus de MediaRecorder (no se usa en producción)
             fut = self._executor.submit(self._process_webm, data)
             fut.add_done_callback(_log_future_error)
         else:
