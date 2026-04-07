@@ -334,7 +334,7 @@ class TranslatorPipeline:
                 if _platform.system() == 'Windows':
                     margin = 2.0
                 else:
-                    margin = 0.2   # solo latencia de red/buffer del browser
+                    margin = 0.0  # Railway: WebRTC no captura audio propio, loop imposible
                 suppress_secs = tts_duration + margin
                 self._suppress_until = time.time() + suppress_secs
                 logger.info('[Pipeline] supresión post-TTS: %.1f s (tts=%.2f s + margen=%.1f s)',
@@ -470,7 +470,7 @@ class TranslatorPipeline:
                     {'role': 'system', 'content': lang['prompt']},
                     {'role': 'user',   'content': text},
                 ],
-                temperature=0.2,
+                temperature=0,
             )
             return resp.choices[0].message.content.strip()
         return _retry(_call, 'GPT')

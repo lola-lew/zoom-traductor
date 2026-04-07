@@ -102,10 +102,10 @@ _CAPTURE_SCRIPT = r"""
   const TARGET_RATE        = 16000;
   const FRAME_MS           = 30;
   const FRAME_SAMPLES      = Math.floor(TARGET_RATE * FRAME_MS / 1000); // 480
-  const SILENCE_FRAMES_END = Math.floor(0.5  / (FRAME_MS / 1000));      // 16 ≈ 500 ms
+  const SILENCE_FRAMES_END = Math.floor(0.3  / (FRAME_MS / 1000));      // 10 ≈ 300 ms
   const MIN_SPEECH_SAMPLES = Math.floor(TARGET_RATE * 0.5);             // 8 000
-  const MAX_SPEECH_SAMPLES = Math.floor(TARGET_RATE * 12);              // 192 000
-  const PADDING_SAMPLES    = Math.floor(TARGET_RATE * 0.3);             // 4 800 (300 ms)
+  const MAX_SPEECH_SAMPLES = Math.floor(TARGET_RATE * 5);               // 80 000
+  const PADDING_SAMPLES    = Math.floor(TARGET_RATE * 0.15);            // 2 400 (150 ms)
   const RMS_THRESHOLD      = 0.015;
 
   // ── WebSocket ─────────────────────────────────────────────────────────
