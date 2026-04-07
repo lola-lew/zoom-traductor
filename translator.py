@@ -307,34 +307,41 @@ class TranslatorPipeline:
             self._update_whisper_prompt(original)
             translated = self._translate(original)
             logger.info('[Pipeline] GPT OK: %r', translated)
-            audio_b64  = self._tts(translated)
-            logger.info('[Pipeline] TTS OK: %d bytes MP3 (b64 len=%d)',
-                        len(audio_b64) * 3 // 4, len(audio_b64))
 
-            # Emitir primero, LUEGO activar supresión post-TTS.
-            # El TTS llega al navegador con ~200-500 ms de latencia + tiempo de reproducción.
-            # Margen de 2 s para cubrir latencia de red + buffering del browser.
-            if self.on_translation:
-                self.on_translation(original, translated, audio_b64)
+            # Lanzar TTS en thread separado — este worker queda libre para el siguiente
+            # utterance sin esperar a que TTS termine (~300-800 ms de latencia OpenAI).
+            tts_fut = self._executor.submit(self._tts, translated)
 
-            # Calcular supresión a partir de la duración real del audio TTS.
-            # MP3 a ~128 kbps → 16 000 bytes/s.
-            tts_bytes    = len(audio_b64) * 3 // 4   # base64 → bytes reales
-            tts_duration = tts_bytes / 16_000.0       # segundos de audio
-            # Margen por plataforma:
-            #   Windows: VB-Cable captura speakers → margen amplio para evitar loopback
-            #   Linux (Railway): bot escucha solo el WebRTC de Zoom, feedback imposible
-            if _platform.system() == 'Windows':
-                margin = 2.0
-            else:
-                margin = 0.4   # solo latencia de red/buffer del browser
-            suppress_secs = tts_duration + margin
-            self._suppress_until = time.time() + suppress_secs
-            logger.info('[Pipeline] supresión post-TTS: %.1f s (tts=%.2f s + margen=%.1f s)',
-                        suppress_secs, tts_duration, margin)
-            # Programar procesamiento del utterance pendiente al expirar la supresión.
-            # Si el coordinador habló durante la supresión, lo procesamos ahora.
-            self._schedule_pending_drain(suppress_secs)
+            def _on_tts_done(fut, _orig=original, _trans=translated):
+                try:
+                    audio_b64 = fut.result()
+                except Exception as exc:
+                    logger.error('[Pipeline] TTS error: %s', exc, exc_info=True)
+                    if self.on_error:
+                        self.on_error(str(exc))
+                    return
+                logger.info('[Pipeline] TTS OK: %d bytes MP3 (b64 len=%d)',
+                            len(audio_b64) * 3 // 4, len(audio_b64))
+                if self.on_translation:
+                    self.on_translation(_orig, _trans, audio_b64)
+                # Calcular supresión a partir de la duración real del audio TTS.
+                # MP3 a ~128 kbps → 16 000 bytes/s.
+                tts_bytes    = len(audio_b64) * 3 // 4
+                tts_duration = tts_bytes / 16_000.0
+                # Margen por plataforma:
+                #   Windows: VB-Cable captura speakers → margen amplio para evitar loopback
+                #   Linux (Railway): bot escucha solo el WebRTC de Zoom, feedback imposible
+                if _platform.system() == 'Windows':
+                    margin = 2.0
+                else:
+                    margin = 0.2   # solo latencia de red/buffer del browser
+                suppress_secs = tts_duration + margin
+                self._suppress_until = time.time() + suppress_secs
+                logger.info('[Pipeline] supresión post-TTS: %.1f s (tts=%.2f s + margen=%.1f s)',
+                            suppress_secs, tts_duration, margin)
+                self._schedule_pending_drain(suppress_secs)
+
+            tts_fut.add_done_callback(_on_tts_done)
 
         except Exception as exc:
             logger.error('[Pipeline] WORKER error: %s', exc, exc_info=True)
