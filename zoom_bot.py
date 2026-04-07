@@ -168,6 +168,12 @@ _CAPTURE_SCRIPT = r"""
     const rms     = Math.sqrt(sum / frame.length);
     const isVoice = rms >= RMS_THRESHOLD;
 
+    if (isVoice && !processVADFrame._loggedVoice) {
+      processVADFrame._loggedVoice = true;
+      console.log('[Capture] primera voz detectada — rms:', rms.toFixed(5),
+                  'threshold:', RMS_THRESHOLD);
+    }
+
     if (isVoice) {
       for (let i = 0; i < frame.length; i++) speechBuf.push(frame[i]);
       silenceFrames = 0;
@@ -205,8 +211,16 @@ _CAPTURE_SCRIPT = r"""
     // ScriptProcessorNode: buffer 4096 para estabilidad, VAD interno procesa en FRAME_SAMPLES
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
+    let frameCount = 0;
     processor.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
+      frameCount++;
+      if (frameCount % 100 === 0) {
+        let s = 0; for (let i = 0; i < input.length; i++) s += input[i] * input[i];
+        const rms = Math.sqrt(s / input.length);
+        console.log('[Capture] frames:', frameCount, 'rms:', rms.toFixed(5),
+                    'audioCtx.state:', audioCtx.state);
+      }
       // Acumular en frameBuf y procesar en chunks de FRAME_SAMPLES
       const merged = new Float32Array(frameBuf.length + input.length);
       merged.set(frameBuf);
@@ -223,7 +237,9 @@ _CAPTURE_SCRIPT = r"""
 
     // audioCtx puede iniciarse en estado 'suspended' en Chrome headless sin
     // interacción de usuario. resume() lo activa explícitamente.
-    audioCtx.resume().catch(e => console.warn('[Capture] audioCtx.resume() error:', e));
+    audioCtx.resume()
+      .then(() => console.log('[Capture] audioCtx.resume() OK — state:', audioCtx.state))
+      .catch(e => console.warn('[Capture] audioCtx.resume() error:', e));
     console.log('[Capture] AudioContext+VAD iniciado — sampleRate:', audioCtx.sampleRate,
                 'state:', audioCtx.state);
   }
@@ -238,7 +254,11 @@ _CAPTURE_SCRIPT = r"""
     if (connectedTracks.has(track.id)) return;
     connectedTracks.add(track.id);
     console.log('[Capture] track detectado — kind:', track.kind, 'id:', track.id,
-                'armed:', captureArmed);
+                'armed:', captureArmed,
+                'readyState:', track.readyState, 'enabled:', track.enabled);
+    track.onended  = () => console.warn('[Capture] track.onended  id:', track.id);
+    track.onmute   = () => console.warn('[Capture] track.onmute   id:', track.id);
+    track.onunmute = () => console.log('[Capture] track.onunmute id:', track.id);
     pendingTrack = track;
     if (captureArmed && !captureStarted) {
       captureStarted = true;
