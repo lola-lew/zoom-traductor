@@ -324,22 +324,19 @@ class TranslatorPipeline:
                             len(audio_b64) * 3 // 4, len(audio_b64))
                 if self.on_translation:
                     self.on_translation(_orig, _trans, audio_b64)
-                # Calcular supresión a partir de la duración real del audio TTS.
-                # MP3 a ~128 kbps → 16 000 bytes/s.
-                tts_bytes    = len(audio_b64) * 3 // 4
-                tts_duration = tts_bytes / 16_000.0
-                # Margen por plataforma:
-                #   Windows: VB-Cable captura speakers → margen amplio para evitar loopback
-                #   Linux (Railway): bot escucha solo el WebRTC de Zoom, feedback imposible
                 if _platform.system() == 'Windows':
-                    margin = 2.0
+                    tts_bytes = len(audio_b64) * 3 // 4
+                    tts_duration = tts_bytes / 16_000.0
+                    suppress_secs = tts_duration + 2.0
+                    self._suppress_until = time.time() + suppress_secs
+                    logger.info('[Pipeline] supresión post-TTS: %.1f s (Windows)', suppress_secs)
+                    self._schedule_pending_drain(suppress_secs)
                 else:
-                    margin = 0.0  # Railway: WebRTC no captura audio propio, loop imposible
-                suppress_secs = tts_duration + margin
-                self._suppress_until = time.time() + suppress_secs
-                logger.info('[Pipeline] supresión post-TTS: %.1f s (tts=%.2f s + margen=%.1f s)',
-                            suppress_secs, tts_duration, margin)
-                self._schedule_pending_drain(suppress_secs)
+                    # Railway/Linux: WebRTC no captura audio propio, loop imposible
+                    # Sin supresión — procesar siguiente utterance inmediatamente
+                    self._suppress_until = 0.0
+                    logger.info('[Pipeline] sin supresión post-TTS (Linux/Railway)')
+                    self._schedule_pending_drain(0.1)
 
             tts_fut.add_done_callback(_on_tts_done)
 
