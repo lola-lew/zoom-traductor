@@ -232,6 +232,11 @@
 
   <!-- Botón -->
   <button id="toggleBtn" onclick="toggle()">Iniciar</button>
+  <a id="downloadBtn" href="/download_audio" download
+     onclick="return checkDownload()"
+     style="display:inline-block;margin-top:8px;padding:8px 18px;background:var(--muted);color:var(--fg);border-radius:6px;text-decoration:none;font-size:0.9em;">
+    Descargar audio
+  </a>
 
   <!-- Link para alumnos -->
   <div class="link-box">
@@ -376,6 +381,12 @@
       .then(d => { log(d.error ? d.error : 'Sesión detenida', d.error ? 'err' : 'ok'); })
       .catch(e => log('Error al detener: ' + e, 'err'))
       .finally(() => { running = false; updateBtn(); setBtn(false); });
+  }
+
+  function checkDownload() {
+    fetch('/download_audio', { method: 'HEAD' })
+      .then(r => { if (r.status === 404) alert('No hay audio grabado en esta sesión.'); });
+    return true;  // dejar que el navegador siga con el link
   }
 
   // ── UI helpers ────────────────────────────────────────────────────────────

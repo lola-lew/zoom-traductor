@@ -161,6 +161,9 @@ class TranslatorPipeline:
         self._whisper_prompt: str = 'Reunión de trabajo. Conversación en español.'
         self._prompt_lock = threading.Lock()
 
+        # Acumulador de audio TTS de la sesión (bytes MP3 en orden)
+        self._audio_chunks: list[bytes] = []
+
         # Callbacks
         self.on_translation: Optional[Callable[[str, str, str], None]] = None
         self.on_error:       Optional[Callable[[str], None]]            = None
@@ -171,6 +174,7 @@ class TranslatorPipeline:
         self.target_lang = target_lang
         self._silent_samples_acc = 0
         self._suppress_until = 0.0
+        self._audio_chunks = []
         with self._pending_lock:
             self._pending_queue.clear()
         with self._dedup_lock:
@@ -182,6 +186,10 @@ class TranslatorPipeline:
     def stop(self) -> None:
         self._running = False
         logger.info('TranslatorPipeline detenido')
+
+    def get_audio_bytes(self) -> bytes:
+        """Retorna el audio MP3 completo de la sesión (concatenación de todos los TTS)."""
+        return b''.join(self._audio_chunks)
 
     # ── Feed de audio (llamado desde el WebSocket interno) ────────────────
 
@@ -322,6 +330,7 @@ class TranslatorPipeline:
                     return
                 logger.info('[Pipeline] TTS OK: %d bytes MP3 (b64 len=%d)',
                             len(audio_b64) * 3 // 4, len(audio_b64))
+                self._audio_chunks.append(base64.b64decode(audio_b64))
                 if self.on_translation:
                     self.on_translation(_orig, _trans, audio_b64)
                 if _platform.system() == 'Windows':

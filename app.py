@@ -19,7 +19,7 @@ from typing import Optional
 
 import websockets
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from flask_sock import Sock
 from flask_socketio import SocketIO, emit
 from playwright.async_api import async_playwright
@@ -343,6 +343,18 @@ def stop():
     _state.update({'running': False, 'bot_state': 'idle', 'meeting_id': None})
     socketio.emit('status_change', {'state': 'idle', 'message': 'Sesión detenida'})
     return jsonify({'status': 'stopped'})
+
+
+@app.route('/download_audio')
+def download_audio():
+    data = translator.get_audio_bytes()
+    if not data:
+        return jsonify({'error': 'No hay audio grabado en esta sesión'}), 404
+    return Response(
+        data,
+        mimetype='audio/mpeg',
+        headers={'Content-Disposition': 'attachment; filename="sesion_traducida.mp3"'},
+    )
 
 
 @app.route('/status')
