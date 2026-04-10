@@ -113,6 +113,10 @@ _CAPTURE_SCRIPT = r"""
   let wsReady = false;
   const pending = [];
 
+  // ── Watchdog ──────────────────────────────────────────────────────────
+  let lastSentTime    = null;   // timestamp (ms) del último sendUtterance()
+  let currentAudioCtx = null;   // AudioContext activo (para cerrar en restart)
+
   function connectWS() {
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
@@ -145,6 +149,7 @@ _CAPTURE_SCRIPT = r"""
       i16[i] = Math.max(-32768, Math.min(32767, Math.round(total[i] * 32767)));
     }
 
+    lastSentTime = Date.now();
     const dur = speechArr.length / TARGET_RATE;
     console.log('[Capture]', label, '— voz=', dur.toFixed(2) + 's',
                 'bytes=', i16.buffer.byteLength);
@@ -204,9 +209,15 @@ _CAPTURE_SCRIPT = r"""
 
   // ── Captura del track WebRTC via AudioContext ─────────────────────────
   function startCapture(track) {
+    // Cerrar AudioContext anterior si existe (watchdog restart)
+    if (currentAudioCtx) {
+      try { currentAudioCtx.close(); } catch(e) {}
+      currentAudioCtx = null;
+    }
     const stream   = new MediaStream([track]);
     // AudioContext a TARGET_RATE — Chrome lo soporta y resamplea internamente
     const audioCtx = new AudioContext({ sampleRate: TARGET_RATE });
+    currentAudioCtx = audioCtx;
     const source   = audioCtx.createMediaStreamSource(stream);
     // ScriptProcessorNode: buffer 4096 para estabilidad, VAD interno procesa en FRAME_SAMPLES
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
@@ -287,6 +298,25 @@ _CAPTURE_SCRIPT = r"""
     return pc;
   };
   Object.assign(window.RTCPeerConnection, _OrigPC);
+
+  // ── Watchdog: reiniciar captura si lleva >30 s sin enviar audio ────────
+  setInterval(() => {
+    if (lastSentTime === null) return;   // aún no se envió ningún utterance
+    const elapsed = Date.now() - lastSentTime;
+    if (elapsed < 30000) return;
+    if (pendingTrack && pendingTrack.readyState === 'live') {
+      console.warn('[Capture] watchdog — sin audio por', (elapsed/1000).toFixed(0) + 's, reiniciando captura');
+      // Resetear estado VAD para empezar limpio
+      speechBuf    = [];
+      inSpeech     = false;
+      silenceFrames = 0;
+      frameBuf     = new Float32Array(0);
+      startCapture(pendingTrack);
+      lastSentTime = Date.now();   // evitar re-trigger inmediato
+    } else {
+      console.warn('[Capture] track ended — sin audio');
+    }
+  }, 30000);
 
   console.log('[Capture] script VAD iniciado — wsUrl:', wsUrl);
 }

@@ -203,13 +203,18 @@ def _on_bot_log(msg: str) -> None:
 
 def _on_bot_state_change(bot_state: str, msg: str) -> None:
     _state['bot_state'] = bot_state
-    if bot_state == DISCONNECTED and _state['running']:
+    if bot_state == DISCONNECTED:
         _state['running'] = False
         translator.stop()
         if _session_log:
             _session_log.close()
     socketio.emit('status_change', {'state': bot_state, 'message': msg})
     socketio.emit('bot_status',    {'message': msg})
+    # Tras informar DISCONNECTED, resetear a idle para que la UI
+    # vuelva a mostrar el botón "Iniciar" y permita reiniciar.
+    if bot_state == DISCONNECTED:
+        _state['bot_state'] = 'idle'
+        socketio.emit('status_change', {'state': 'idle', 'message': msg})
 
 
 # ── Rutas HTTP ────────────────────────────────────────────────────────────────
