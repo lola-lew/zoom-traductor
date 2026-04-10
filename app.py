@@ -324,17 +324,24 @@ def stop():
 
     async def _stop_bots():
         global _shared_playwright, _shared_browser
+        # leave() cierra page → context → (browser solo si _owns_browser).
+        # Como el browser es compartido (_owns_browser=False), leave() deja el
+        # browser intacto pero garantiza que el contexto Zoom ya fue cerrado.
         if _zoom_bot:
             await _zoom_bot.leave()
+        # Cerrar el browser compartido y playwright después de que el bot
+        # haya liberado su contexto/página.
         if _shared_browser:
             try:
                 await _shared_browser.close()
+                logger.info('[App] browser compartido cerrado')
             except Exception:
                 pass
             _shared_browser = None
         if _shared_playwright:
             try:
                 await _shared_playwright.stop()
+                logger.info('[App] playwright detenido')
             except Exception:
                 pass
             _shared_playwright = None

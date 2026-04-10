@@ -1337,38 +1337,55 @@ class ZoomBot:
     # ── Salida limpia ──────────────────────────────────────────────────────
 
     async def leave(self) -> None:
-        """Cierra el browser sin dejar procesos huérfanos.
+        """Cierra page → context → browser en orden estricto, sin dejar tabs zombie.
 
-        Si el browser fue provisto externamente (_owns_browser=False), solo
-        se cierran page y context; el browser/playwright los cierra quien los creó.
+        El orden importa: Playwright mantiene referencias internas que se liberan
+        correctamente solo si se cierran de más específico a más general.
+        El context se cierra siempre (es exclusivo de este bot), incluso cuando
+        el browser fue provisto externamente (_owns_browser=False).
         """
         self._monitoring = False
 
-        # Siempre cerramos page y context (son exclusivos de este bot)
-        for attr, label in (('_page', 'página'), ('_context', 'contexto')):
-            obj = getattr(self, attr)
-            if obj is None:
-                continue
+        # 1. Page — cerrar explícitamente antes del contexto
+        if self._page is not None:
             try:
-                await obj.close()
+                if not self._page.is_closed():
+                    await self._page.close()
+                    logger.info('[ZoomBot] página cerrada')
             except Exception as exc:
-                logger.error('Error cerrando %s: %s', label, exc)
+                logger.error('Error cerrando página: %s', exc)
             finally:
-                setattr(self, attr, None)
+                self._page = None
 
-        # Solo cerramos browser/playwright si los creamos nosotros
+        # 2. Context — siempre cerrar, incluso si el browser es compartido.
+        # Es el contexto Zoom aislado: cerrarlo desconecta el tab de WebRTC.
+        if self._context is not None:
+            try:
+                await self._context.close()
+                logger.info('[ZoomBot] contexto cerrado')
+            except Exception as exc:
+                logger.error('Error cerrando contexto: %s', exc)
+            finally:
+                self._context = None
+
+        # 3. Browser y Playwright — solo si los creamos nosotros
         if self._owns_browser:
-            for attr, label in (('_browser', 'browser'), ('_playwright', 'playwright')):
-                obj = getattr(self, attr)
-                if obj is None:
-                    continue
+            if self._browser is not None:
                 try:
-                    close = getattr(obj, 'close', None) or getattr(obj, 'stop', None)
-                    if close:
-                        await close()
+                    await self._browser.close()
+                    logger.info('[ZoomBot] browser cerrado')
                 except Exception as exc:
-                    logger.error('Error cerrando %s: %s', label, exc)
+                    logger.error('Error cerrando browser: %s', exc)
                 finally:
-                    setattr(self, attr, None)
+                    self._browser = None
+
+            if self._playwright is not None:
+                try:
+                    await self._playwright.stop()
+                    logger.info('[ZoomBot] playwright detenido')
+                except Exception as exc:
+                    logger.error('Error deteniendo playwright: %s', exc)
+                finally:
+                    self._playwright = None
 
         self._set_state(DISCONNECTED, 'ZoomBot desconectado')
